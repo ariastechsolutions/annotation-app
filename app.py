@@ -48,10 +48,6 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "SAR Annotation Desktop"
-DEFAULT_ROOT = Path(__file__).resolve().parent.parent / "coregistered_data"
-RECENT_PROJECTS_PATH = Path.home() / ".sar_annotation_recent_projects.json"
-APP_ICON_PATH = Path(__file__).resolve().parent / "ats_bar_logo.png"
-APP_LOGO_PATH = Path(__file__).resolve().parent / "ats_logo.png"
 TILE_NAME_RE = re.compile(r"tile_r(?P<row>-?\d+)_c(?P<col>-?\d+)\.tif$", re.IGNORECASE)
 
 DARK_TOKENS = {
@@ -89,6 +85,17 @@ LIGHT_TOKENS = {
 
 def apply_dark_theme(app: QApplication) -> None:
     apply_theme(app, DARK_TOKENS)
+
+
+def resource_path(name: str) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / name
+
+
+DEFAULT_ROOT = Path.cwd() / "coregistered_data"
+RECENT_PROJECTS_PATH = Path.home() / ".sar_annotation_recent_projects.json"
+APP_ICON_PATH = resource_path("ats_bar_logo.png")
+APP_LOGO_PATH = resource_path("ats_logo.png")
 
 
 def apply_theme(app: QApplication, t: dict) -> None:

@@ -18,6 +18,21 @@ pip install -r requirements.txt
 python app.py
 ```
 
+## Build a Windows exe
+
+```powershell
+pip install pyinstaller
+.\build_exe.ps1
+```
+
+The packaged app will be created at:
+
+```powershell
+.\dist\SAR_Annotation.exe
+```
+
+You can give that single file to teammates. They do not need Python installed.
+
 ## Expected folder structure
 
 The selected project root should contain:
