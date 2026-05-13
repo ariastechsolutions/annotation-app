@@ -1,18 +1,20 @@
-#define MyAppName "SAR Annotation Desktop"
-#define MyAppVersion "1.0.0"
+#define MyAppName "ATS Annotation Tool"
+#define MyAppVersion "1.0.1.0"
 #define MyAppPublisher "Aria's Tech Solutions"
-#define MyAppExeName "SAR_Annotation.exe"
+#define MyAppExeName "ATS_Annotation_Tool.exe"
 
 [Setup]
 AppId={{8A2B4F8D-7C2B-4F83-9B1A-2E3D1F3C0B11}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
+AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\ATS\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=installer_output
-OutputBaseFilename=SAR_Annotation_Setup
+OutputBaseFilename=ATS_Annotation_Tool_Setup
+UninstallDisplayName={#MyAppName}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

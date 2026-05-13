@@ -4,7 +4,7 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
-base_dir = Path(__file__).resolve().parent
+base_dir = Path.cwd()
 
 datas = [
     (str(base_dir / "ats_logo.png"), "."),
@@ -43,7 +43,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="SAR_Annotation",
+    name="ATS_Annotation_Tool",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

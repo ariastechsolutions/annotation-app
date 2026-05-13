@@ -1,6 +1,6 @@
-# SAR Annotation Desktop
+# ATS Annotation Tool
 
-This folder contains the modern desktop version of the SAR annotation app built with PySide6.
+This folder contains the modern desktop version of the annotation app built with PySide6.
 
 ## What it does
 
@@ -10,6 +10,7 @@ This folder contains the modern desktop version of the SAR annotation app built 
 - Lets you draw bounding boxes on either view.
 - Switches to a SAR-only metadata page for per-box labeling.
 - Exports georeferenced mask TIFFs and GeoJSON files.
+- Checks GitHub Releases for updates and lets the user install them after confirmation.
 
 ## Run
 
@@ -28,7 +29,7 @@ pip install pyinstaller
 The packaged app will be created at:
 
 ```powershell
-.\dist\SAR_Annotation.exe
+.\dist\ATS_Annotation_Tool.exe
 ```
 
 ## Build a Windows installer
@@ -46,10 +47,18 @@ To create a normal Windows installer that teammates can run like any other setup
 The installer will be created under:
 
 ```powershell
-.\installer_output\SAR_Annotation_Setup.exe
+.\installer_output\ATS_Annotation_Tool_Setup.exe
 ```
 
 Give your teammates that setup file. They can double-click it to install the app on Windows.
+
+## Update behavior
+
+The installed ATS Annotation Tool checks the latest GitHub release on startup and also exposes a `check updates` button in the top bar.
+
+If a newer release is found, the app prompts the user before downloading and launching the installer.
+
+For the update flow to work, publish each new build as a GitHub Release and attach the installer `.exe` as the release asset.
 
 ## Expected folder structure
 
