@@ -4,6 +4,10 @@ import json
 import re
 import ctypes
 import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -15,8 +19,8 @@ from rasterio.features import rasterize
 from rasterio.transform import from_bounds
 from rasterio.warp import Resampling, reproject, transform_bounds
 from shapely.geometry import Polygon, mapping, shape
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal, QObject, QThread, QProcess, QUrl
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QImage, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -47,8 +51,13 @@ from PySide6.QtWidgets import (
 )
 
 
-APP_TITLE = "SAR Annotation Desktop"
+APP_TITLE = "ATS Annotation Tool"
+APP_VERSION = "1.0.1.0"
+UPDATE_OWNER = "ariastechsolutions"
+UPDATE_REPO = "annotation-app"
+UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
 TILE_NAME_RE = re.compile(r"tile_r(?P<row>-?\d+)_c(?P<col>-?\d+)\.tif$", re.IGNORECASE)
+NATURAL_PARTS_RE = re.compile(r"(\d+)")
 
 DARK_TOKENS = {
     "bg0": "#0e0f11",
@@ -300,6 +309,15 @@ def apply_theme(app: QApplication, t: dict) -> None:
             background-color: {t["bg3"]};
             color: {t["text_primary"]};
         }}
+        QLabel#VersionPill {{
+            background: {t["bg2"]};
+            color: {t["text_secondary"]};
+            border: 1px solid {t["border"]};
+            border-radius: 6px;
+            padding: 4px 8px;
+            font-size: 11px;
+            font-family: "DM Mono", monospace;
+        }}
         QPushButton#BrowseBtn {{
             background: {t["bg3"]};
             border: 1px solid {t["border_strong"]};
@@ -375,7 +393,122 @@ def apply_theme(app: QApplication, t: dict) -> None:
             border-radius: 2px;
         }}
         """
-    )
+    ) 
+
+
+def normalize_version(value: str) -> tuple[int, ...]:
+    cleaned = str(value).strip()
+    if cleaned.lower().startswith("v"):
+        cleaned = cleaned[1:]
+    parts: list[int] = []
+    for chunk in cleaned.split("."):
+        match = re.match(r"(\d+)", chunk)
+        if not match:
+            break
+        parts.append(int(match.group(1)))
+    return tuple(parts)
+
+
+def version_is_newer(latest: str, current: str) -> bool:
+    try:
+        return normalize_version(latest) > normalize_version(current)
+    except Exception:
+        return False
+
+
+def choose_release_asset(release: dict) -> dict | None:
+    assets = release.get("assets", [])
+    if not isinstance(assets, list):
+        return None
+    preferred = []
+    fallback = []
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name", "")).lower()
+        if not name.endswith(".exe"):
+            continue
+        fallback.append(asset)
+        if "setup" in name or "installer" in name:
+            preferred.append(asset)
+    if preferred:
+        return preferred[0]
+    if fallback:
+        return fallback[0]
+    return None
+
+
+class UpdateCheckWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, current_version: str):
+        super().__init__()
+        self.current_version = current_version
+
+    def run(self):
+        try:
+            request = urllib.request.Request(
+                UPDATE_API_URL,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": f"{APP_TITLE}/{self.current_version}",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                release = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        tag = str(release.get("tag_name", release.get("name", ""))).strip()
+        if not tag:
+            self.finished.emit({"available": False})
+            return
+        if not version_is_newer(tag, self.current_version):
+            self.finished.emit({"available": False, "latest_version": tag})
+            return
+        asset = choose_release_asset(release)
+        payload = {
+            "available": True,
+            "latest_version": tag,
+            "release_name": release.get("name") or tag,
+            "body": release.get("body", ""),
+            "html_url": release.get("html_url", ""),
+            "download_url": asset.get("browser_download_url") if asset else "",
+            "asset_name": asset.get("name") if asset else "",
+        }
+        self.finished.emit(payload)
+
+
+class UpdateDownloadWorker(QObject):
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, url: str, destination: Path):
+        super().__init__()
+        self.url = url
+        self.destination = destination
+
+    def run(self):
+        try:
+            request = urllib.request.Request(
+                self.url,
+                headers={
+                    "Accept": "application/octet-stream",
+                    "User-Agent": f"{APP_TITLE}/{APP_VERSION}",
+                },
+            )
+            self.destination.parent.mkdir(parents=True, exist_ok=True)
+            with urllib.request.urlopen(request, timeout=60) as response, self.destination.open("wb") as handle:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit(str(self.destination))
 
 
 def load_pixmap(path: Path, size: int | None = None) -> QPixmap | None:
@@ -528,13 +661,26 @@ def parse_tile_key(path: Path):
     return int(match.group("row")), int(match.group("col"))
 
 
+def tile_match_key(path: Path) -> str:
+    return path.stem.strip().lower()
+
+
+def natural_sort_key(value: str):
+    parts = NATURAL_PARTS_RE.split(value)
+    key = []
+    for part in parts:
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part))
+    return key
+
+
 def sorted_tif_files(folder: Path):
     items = []
     for path in folder.glob("*.tif"):
-        key = parse_tile_key(path)
-        if key is not None:
-            items.append((key, path))
-    items.sort(key=lambda item: item[0])
+        items.append((tile_match_key(path), path))
+    items.sort(key=lambda item: natural_sort_key(item[0]))
     return items
 
 
@@ -1549,7 +1695,7 @@ class SetupPage(QWidget):
         hero_layout = QVBoxLayout(hero)
         hero_layout.setContentsMargins(18, 14, 18, 14)
         hero_layout.setSpacing(6)
-        title = QLabel("SAR Annotation Desktop")
+        title = QLabel("ATS Annotation Tool")
         title.setObjectName("HeroTitle")
         subtitle = QLabel(
             "Geospatial annotation tool for paired SAR and optical raster tiles. Draw building boxes, "
@@ -1576,9 +1722,9 @@ class SetupPage(QWidget):
         path_form.setHorizontalSpacing(10)
         path_form.setVerticalSpacing(10)
         for row, (label_text, widget, browse) in enumerate([
+            ("Project root / output directory", self.output_dir, True),
             ("SAR tiles directory", self.sar_dir, True),
             ("Optical tiles directory", self.optical_dir, True),
-            ("Project root / output directory", self.output_dir, True),
         ]):
             label = QLabel(label_text)
             label.setObjectName("MutedText")
@@ -1587,7 +1733,10 @@ class SetupPage(QWidget):
             if browse:
                 btn = QPushButton("Browse")
                 btn.setObjectName("BrowseBtn")
-                btn.clicked.connect(lambda _=False, line=widget: self._browse(line))
+                if widget is self.output_dir:
+                    btn.clicked.connect(lambda _=False: self._browse_project_root())
+                else:
+                    btn.clicked.connect(lambda _=False, line=widget: self._browse(line))
                 path_form.addWidget(btn, row, 2)
         left_layout.addLayout(path_form)
 
@@ -1715,6 +1864,63 @@ class SetupPage(QWidget):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder", line_edit.text() or str(DEFAULT_ROOT))
         if folder:
             line_edit.setText(folder)
+
+    def _browse_project_root(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Project Root", self.output_dir.text() or str(Path.cwd()))
+        if not folder:
+            return
+        self.output_dir.setText(folder)
+        self._prompt_detect_project_folders(Path(folder))
+
+    def _prompt_detect_project_folders(self, root_folder: Path):
+        sar_guess = root_folder / "sar_tiles"
+        optical_guess = root_folder / "optical_tiles"
+        if sar_guess.is_dir() and optical_guess.is_dir():
+            dialog = QMessageBox(self)
+            dialog.setWindowTitle("Detected project folders")
+            dialog.setIcon(QMessageBox.Question)
+            dialog.setText("SAR and optical folders were found under the selected project root.")
+            dialog.setInformativeText(
+                f"SAR: {sar_guess}\n"
+                f"Optical: {optical_guess}\n\n"
+                "Use these folders or choose different ones?"
+            )
+            use_btn = dialog.addButton("Use Detected", QMessageBox.AcceptRole)
+            change_btn = dialog.addButton("Change Manually", QMessageBox.ActionRole)
+            cancel_btn = dialog.addButton(QMessageBox.Cancel)
+            dialog.exec()
+            clicked = dialog.clickedButton()
+            if clicked == use_btn:
+                self.sar_dir.setText(str(sar_guess))
+                self.optical_dir.setText(str(optical_guess))
+                self.metadataChanged.emit()
+                return
+            if clicked == change_btn:
+                self._choose_project_folders(str(sar_guess), str(optical_guess))
+                return
+            return
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Project folders not found")
+        dialog.setIcon(QMessageBox.Question)
+        dialog.setText("Could not automatically find SAR and optical folders in this project root.")
+        dialog.setInformativeText("Would you like to choose the SAR and optical folders manually now?")
+        yes_btn = dialog.addButton("Choose Manually", QMessageBox.AcceptRole)
+        dialog.addButton(QMessageBox.Cancel)
+        dialog.exec()
+        if dialog.clickedButton() == yes_btn:
+            self._choose_project_folders(str(sar_guess), str(optical_guess))
+
+    def _choose_project_folders(self, sar_start: str = "", optical_start: str = ""):
+        sar_folder = QFileDialog.getExistingDirectory(self, "Select SAR tiles folder", sar_start or self.sar_dir.text() or str(DEFAULT_ROOT))
+        if not sar_folder:
+            return
+        optical_folder = QFileDialog.getExistingDirectory(self, "Select Optical tiles folder", optical_start or self.optical_dir.text() or str(DEFAULT_ROOT))
+        if not optical_folder:
+            return
+        self.sar_dir.setText(sar_folder)
+        self.optical_dir.setText(optical_folder)
+        self.metadataChanged.emit()
 
     def set_recent_projects(self, projects: list[dict]):
         self.recent_list.clear()
@@ -2127,6 +2333,11 @@ class MainWindow(QMainWindow):
         self._state_save_pending = False
         self._startup_recent_prompt_done = False
         self._restored_tile_states = {}
+        self._update_check_started = False
+        self._update_thread = None
+        self._update_worker = None
+        self._download_thread = None
+        self._download_worker = None
 
         self.stack = QStackedWidget()
         self.setup_page = SetupPage()
@@ -2184,6 +2395,15 @@ class MainWindow(QMainWindow):
         self.mode_toggle.clicked.connect(self.toggle_theme)
         top_layout.addWidget(self.mode_toggle)
 
+        self.update_button = QPushButton("check updates")
+        self.update_button.setObjectName("ModeToggle")
+        self.update_button.clicked.connect(self.check_for_updates)
+        top_layout.addWidget(self.update_button)
+
+        self.version_label = QLabel(f"v{APP_VERSION}")
+        self.version_label.setObjectName("VersionPill")
+        top_layout.addWidget(self.version_label)
+
         central_layout.addWidget(self.top_bar)
         central_layout.addWidget(self.stack, 1)
         self.setCentralWidget(central)
@@ -2231,6 +2451,7 @@ class MainWindow(QMainWindow):
         self._load_recent_projects()
         self.setup_page.set_recent_projects(self.recent_projects)
         QTimer.singleShot(0, self._prompt_resume_recent_project)
+        QTimer.singleShot(1800, self.check_for_updates)
         self._update_status("Ready")
 
     def _sync_setup_defaults(self):
@@ -2246,6 +2467,106 @@ class MainWindow(QMainWindow):
 
     def _update_status(self, text: str):
         self.status.showMessage(text)
+
+    def check_for_updates(self):
+        if self._update_check_started:
+            return
+        self._update_check_started = True
+        self._update_status("Checking ATS updates...")
+        self._update_thread = QThread(self)
+        self._update_worker = UpdateCheckWorker(APP_VERSION)
+        self._update_worker.moveToThread(self._update_thread)
+        self._update_thread.started.connect(self._update_worker.run)
+        self._update_worker.finished.connect(self._on_update_check_finished)
+        self._update_worker.failed.connect(self._on_update_check_failed)
+        self._update_worker.finished.connect(self._update_thread.quit)
+        self._update_worker.failed.connect(self._update_thread.quit)
+        self._update_thread.finished.connect(self._update_thread.deleteLater)
+        self._update_worker.finished.connect(self._update_worker.deleteLater)
+        self._update_worker.failed.connect(self._update_worker.deleteLater)
+        self._update_thread.start()
+
+    def _on_update_check_failed(self, message: str):
+        self._update_status("Ready")
+        self.update_button.setText("check updates")
+        self.update_button.setEnabled(True)
+        self._update_check_started = False
+
+    def _on_update_check_finished(self, payload):
+        self._update_status("Ready")
+        self.update_button.setText("check updates")
+        self.update_button.setEnabled(True)
+        self._update_check_started = False
+        if not isinstance(payload, dict) or not payload.get("available"):
+            return
+        latest_version = str(payload.get("latest_version", "")).strip()
+        release_name = str(payload.get("release_name", latest_version)).strip()
+        body = str(payload.get("body", "")).strip()
+        download_url = str(payload.get("download_url", "")).strip()
+        html_url = str(payload.get("html_url", "")).strip()
+        message = (
+            f"ATS Annotation Tool {latest_version} is available.\n\n"
+            f"You are running {APP_VERSION}.\n\n"
+            "Do you want to download and install the update now?"
+        )
+        if body:
+            message += f"\n\nRelease notes:\n{body[:800]}"
+        response = QMessageBox.question(
+            self,
+            "ATS Annotation Tool update available",
+            message,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if response != QMessageBox.Yes:
+            return
+        if not download_url:
+            if html_url:
+                QDesktopServices.openUrl(QUrl(html_url))
+            else:
+                QMessageBox.information(
+                    self,
+                    "ATS update unavailable",
+                    "A release was found, but no installer asset was attached to it.",
+                )
+            return
+        self._download_and_install_update(download_url, latest_version)
+
+    def _download_and_install_update(self, url: str, latest_version: str):
+        self._update_status(f"Downloading ATS update {latest_version}...")
+        self.update_button.setEnabled(False)
+        temp_root = Path(tempfile.gettempdir()) / "ATS_Annotation_Updates"
+        filename = Path(urllib.parse.urlparse(url).path).name or "ATS_Annotation_Update.exe"
+        destination = temp_root / filename
+        self._download_thread = QThread(self)
+        self._download_worker = UpdateDownloadWorker(url, destination)
+        self._download_worker.moveToThread(self._download_thread)
+        self._download_thread.started.connect(self._download_worker.run)
+        self._download_worker.finished.connect(lambda path: self._on_update_download_finished(Path(path)))
+        self._download_worker.failed.connect(self._on_update_download_failed)
+        self._download_worker.finished.connect(self._download_thread.quit)
+        self._download_worker.failed.connect(self._download_thread.quit)
+        self._download_thread.finished.connect(self._download_thread.deleteLater)
+        self._download_worker.finished.connect(self._download_worker.deleteLater)
+        self._download_worker.failed.connect(self._download_worker.deleteLater)
+        self._download_thread.start()
+
+    def _on_update_download_failed(self, message: str):
+        self._update_status("Ready")
+        self.update_button.setEnabled(True)
+        QMessageBox.warning(
+            self,
+            "Update download failed",
+            f"Could not download the update.\n\n{message}",
+        )
+
+    def _on_update_download_finished(self, installer_path: Path):
+        if not installer_path.is_file():
+            self._on_update_download_failed("Downloaded installer file was not found.")
+            return
+        self._update_status("Launching ATS update installer...")
+        QProcess.startDetached(str(installer_path), [], str(installer_path.parent))
+        QTimer.singleShot(250, QApplication.instance().quit)
 
     def _project_state_path(self, output_dir: str | Path | None = None):
         root = output_dir if output_dir is not None else self.output_dir
