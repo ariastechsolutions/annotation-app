@@ -457,19 +457,39 @@ class UpdateCheckWorker(QObject):
             )
             with urllib.request.urlopen(request, timeout=10) as response:
                 release = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                self.finished.emit({
+                    "available": False,
+                    "status": "no_release",
+                    "message": "No GitHub release has been published yet.",
+                })
+                return
+            self.failed.emit(f"GitHub returned HTTP {exc.code}: {exc.reason}")
+            return
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(f"Could not reach GitHub: {exc}")
             return
         tag = str(release.get("tag_name", release.get("name", ""))).strip()
         if not tag:
-            self.finished.emit({"available": False})
+            self.finished.emit({
+                "available": False,
+                "status": "invalid_release",
+                "message": "The latest GitHub release does not have a version tag.",
+            })
             return
         if not version_is_newer(tag, self.current_version):
-            self.finished.emit({"available": False, "latest_version": tag})
+            self.finished.emit({
+                "available": False,
+                "status": "up_to_date",
+                "latest_version": tag,
+                "message": f"ATS Annotation Tool {self.current_version} is already up to date.",
+            })
             return
         asset = choose_release_asset(release)
         payload = {
             "available": True,
+            "status": "update_available",
             "latest_version": tag,
             "release_name": release.get("name") or tag,
             "body": release.get("body", ""),
@@ -2397,7 +2417,7 @@ class MainWindow(QMainWindow):
 
         self.update_button = QPushButton("check updates")
         self.update_button.setObjectName("ModeToggle")
-        self.update_button.clicked.connect(self.check_for_updates)
+        self.update_button.clicked.connect(lambda: self.check_for_updates(True))
         top_layout.addWidget(self.update_button)
 
         self.version_label = QLabel(f"v{APP_VERSION}")
@@ -2451,7 +2471,7 @@ class MainWindow(QMainWindow):
         self._load_recent_projects()
         self.setup_page.set_recent_projects(self.recent_projects)
         QTimer.singleShot(0, self._prompt_resume_recent_project)
-        QTimer.singleShot(1800, self.check_for_updates)
+        QTimer.singleShot(1800, lambda: self.check_for_updates(False))
         self._update_status("Ready")
 
     def _sync_setup_defaults(self):
@@ -2468,11 +2488,12 @@ class MainWindow(QMainWindow):
     def _update_status(self, text: str):
         self.status.showMessage(text)
 
-    def check_for_updates(self):
+    def check_for_updates(self, show_dialog: bool = False):
         if self._update_check_started:
             return
         self._update_check_started = True
         self._update_status("Checking ATS updates...")
+        self._update_show_dialog = show_dialog
         self._update_thread = QThread(self)
         self._update_worker = UpdateCheckWorker(APP_VERSION)
         self._update_worker.moveToThread(self._update_thread)
@@ -2491,13 +2512,24 @@ class MainWindow(QMainWindow):
         self.update_button.setText("check updates")
         self.update_button.setEnabled(True)
         self._update_check_started = False
+        if getattr(self, "_update_show_dialog", False):
+            QMessageBox.warning(
+                self,
+                "ATS update check failed",
+                message,
+            )
 
     def _on_update_check_finished(self, payload):
         self._update_status("Ready")
         self.update_button.setText("check updates")
         self.update_button.setEnabled(True)
         self._update_check_started = False
+        show_dialog = getattr(self, "_update_show_dialog", False)
         if not isinstance(payload, dict) or not payload.get("available"):
+            if show_dialog and isinstance(payload, dict):
+                reason = str(payload.get("message", "")).strip()
+                if reason:
+                    QMessageBox.information(self, "ATS update status", reason)
             return
         latest_version = str(payload.get("latest_version", "")).strip()
         release_name = str(payload.get("release_name", latest_version)).strip()
