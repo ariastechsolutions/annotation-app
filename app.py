@@ -52,7 +52,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.4"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
