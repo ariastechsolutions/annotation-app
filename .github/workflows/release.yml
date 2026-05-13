@@ -81,21 +81,6 @@ jobs:
         shell: powershell
         run: powershell -ExecutionPolicy Bypass -File .\build_installer.ps1
 
-      - name: Read app version
-        id: version
-        shell: powershell
-        run: |
-          $content = Get-Content app.py -Raw
-          if ($content -match 'APP_VERSION\s*=\s*"([^"]+)"') {
-            $baseVersion = $Matches[1]
-          } else {
-            throw "APP_VERSION not found in app.py"
-          }
-          $releaseVersion = "$baseVersion.$env:GITHUB_RUN_NUMBER"
-          "base_version=$baseVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "release_version=$releaseVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "tag_name=v$releaseVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
