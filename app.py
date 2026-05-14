@@ -52,7 +52,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
@@ -2415,7 +2415,7 @@ class MainWindow(QMainWindow):
 
         top_layout.addSpacing(12)
         self.theme_mode = "dark"
-        self.mode_toggle = QPushButton("dark")
+        self.mode_toggle = QPushButton("☀")
         self.mode_toggle.setObjectName("ModeToggle")
         self.mode_toggle.setCheckable(True)
         self.mode_toggle.setChecked(True)
@@ -2909,12 +2909,12 @@ class MainWindow(QMainWindow):
         if self.theme_mode == "dark":
             self.theme_mode = "light"
             tokens = LIGHT_TOKENS
-            self.mode_toggle.setText("light")
+            self.mode_toggle.setText("☾")
             self.mode_toggle.setChecked(False)
         else:
             self.theme_mode = "dark"
             tokens = DARK_TOKENS
-            self.mode_toggle.setText("dark")
+            self.mode_toggle.setText("☀")
             self.mode_toggle.setChecked(True)
         apply_theme(app, tokens)
         for pane in [self.annotate_page.sar_pane, self.annotate_page.optical_pane, self.metadata_page.sar_pane]:
