@@ -52,10 +52,11 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
+UPDATE_MANIFEST_URL = f"https://raw.githubusercontent.com/{UPDATE_OWNER}/{UPDATE_REPO}/master/qt_desktop/update_manifest.json"
 TILE_NAME_RE = re.compile(r"tile_r(?P<row>-?\d+)_c(?P<col>-?\d+)\.tif$", re.IGNORECASE)
 NATURAL_PARTS_RE = re.compile(r"(\d+)")
 
@@ -101,10 +102,17 @@ def resource_path(name: str) -> Path:
     return base / name
 
 
+def runtime_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 DEFAULT_ROOT = Path.cwd() / "coregistered_data"
 RECENT_PROJECTS_PATH = Path.home() / ".sar_annotation_recent_projects.json"
 APP_ICON_PATH = resource_path("ats_bar_logo.png")
 APP_LOGO_PATH = resource_path("ats_logo.png")
+LOCAL_UPDATE_MANIFEST_PATH = runtime_root() / "update_manifest.local.json"
 
 
 def apply_theme(app: QApplication, t: dict) -> None:
@@ -445,6 +453,22 @@ def choose_release_asset(release: dict) -> dict | None:
     return None
 
 
+def fetch_json(url: str, timeout: int = 10) -> dict:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": f"{APP_TITLE}/{APP_VERSION}",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def load_json_file(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 class UpdateCheckWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
@@ -454,16 +478,73 @@ class UpdateCheckWorker(QObject):
         self.current_version = current_version
 
     def run(self):
+        manifest = None
+        manifest_source = ""
+
+        if LOCAL_UPDATE_MANIFEST_PATH.is_file():
+            try:
+                manifest = load_json_file(LOCAL_UPDATE_MANIFEST_PATH)
+                manifest_source = "local override"
+            except Exception as exc:
+                self.failed.emit(f"Local update manifest is invalid: {exc}")
+                return
+        else:
+            try:
+                manifest = fetch_json(UPDATE_MANIFEST_URL, timeout=6)
+                manifest_source = "GitHub manifest"
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    self.failed.emit(f"GitHub manifest returned HTTP {exc.code}: {exc.reason}")
+                    return
+            except Exception:
+                manifest = None
+
         try:
-            request = urllib.request.Request(
-                UPDATE_API_URL,
-                headers={
-                    "Accept": "application/vnd.github+json",
-                    "User-Agent": f"{APP_TITLE}/{self.current_version}",
-                },
-            )
-            with urllib.request.urlopen(request, timeout=10) as response:
-                release = json.loads(response.read().decode("utf-8"))
+            manifest = manifest if isinstance(manifest, dict) else None
+        except Exception:
+            manifest = None
+
+        if isinstance(manifest, dict):
+            tag = str(manifest.get("latest_version", manifest.get("tag_name", ""))).strip()
+            if tag and version_is_newer(tag, self.current_version):
+                release_url = str(manifest.get("release_url", "")).strip()
+                download_url = str(manifest.get("download_url", "")).strip()
+                payload = {
+                    "available": True,
+                    "status": "update_available",
+                    "source": manifest_source or "manifest",
+                    "latest_version": tag,
+                    "release_name": str(manifest.get("release_name", f"ATS Annotation Tool {tag}")).strip(),
+                    "body": str(manifest.get("body", "")).strip(),
+                    "html_url": release_url,
+                    "download_url": download_url,
+                    "asset_name": str(manifest.get("asset_name", "")).strip(),
+                }
+                if not payload["download_url"]:
+                    try:
+                        release = fetch_json(UPDATE_API_URL, timeout=10)
+                        asset = choose_release_asset(release)
+                        payload["download_url"] = asset.get("browser_download_url") if asset else ""
+                        payload["asset_name"] = asset.get("name") if asset else ""
+                        payload["html_url"] = payload["html_url"] or str(release.get("html_url", "")).strip()
+                        payload["body"] = payload["body"] or str(release.get("body", "")).strip()
+                        payload["release_name"] = payload["release_name"] or str(release.get("name") or tag).strip()
+                    except Exception:
+                        pass
+                self.finished.emit(payload)
+                return
+            if tag:
+                self.finished.emit({
+                    "available": False,
+                    "status": "up_to_date",
+                    "source": manifest_source or "manifest",
+                    "latest_version": tag,
+                    "message": f"ATS Annotation Tool {self.current_version} is already up to date according to the {manifest_source or 'manifest'}.",
+                })
+                return
+
+        try:
+            release = fetch_json(UPDATE_API_URL, timeout=10)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 self.finished.emit({
@@ -497,6 +578,7 @@ class UpdateCheckWorker(QObject):
         payload = {
             "available": True,
             "status": "update_available",
+            "source": "release",
             "latest_version": tag,
             "release_name": release.get("name") or tag,
             "body": release.get("body", ""),
@@ -2545,12 +2627,16 @@ class MainWindow(QMainWindow):
         if not isinstance(payload, dict) or not payload.get("available"):
             status = str(payload.get("status", "")).strip() if isinstance(payload, dict) else ""
             reason = str(payload.get("message", "")).strip() if isinstance(payload, dict) else ""
+            source = str(payload.get("source", "")).strip() if isinstance(payload, dict) else ""
             if status == "up_to_date":
-                self._set_update_log(f"update: up to date ({payload.get('latest_version', APP_VERSION)})")
+                source_suffix = f" from {source}" if source else ""
+                self._set_update_log(f"update: up to date ({payload.get('latest_version', APP_VERSION)}{source_suffix})")
             elif status == "no_release":
                 self._set_update_log("update: no GitHub release yet")
             elif status == "invalid_release":
                 self._set_update_log("update: invalid GitHub release")
+            elif status == "invalid_manifest":
+                self._set_update_log("update: invalid update manifest")
             else:
                 self._set_update_log("update: no update found")
             if show_dialog and isinstance(payload, dict):
@@ -2562,7 +2648,9 @@ class MainWindow(QMainWindow):
         body = str(payload.get("body", "")).strip()
         download_url = str(payload.get("download_url", "")).strip()
         html_url = str(payload.get("html_url", "")).strip()
-        self._set_update_log(f"update: available {latest_version}")
+        source = str(payload.get("source", "")).strip()
+        source_suffix = f" ({source})" if source else ""
+        self._set_update_log(f"update: available {latest_version}{source_suffix}")
         message = (
             f"ATS Annotation Tool {latest_version} is available.\n\n"
             f"You are running {APP_VERSION}.\n\n"

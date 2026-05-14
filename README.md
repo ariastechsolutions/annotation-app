@@ -60,6 +60,21 @@ If a newer release is found, the app prompts the user before downloading and lau
 
 For the update flow to work, publish each new build as a GitHub Release and attach the installer `.exe` as the release asset.
 
+## Fast update testing
+
+The app also checks a small `update_manifest.local.json` file before it falls back to the GitHub manifest and then GitHub Releases.
+
+That gives you a fast test path:
+
+1. Copy `update_manifest.json` to `update_manifest.local.json`.
+2. Set `latest_version` higher than the installed app version.
+3. Put `update_manifest.local.json` next to the installed `.exe` during local testing.
+4. Click `check updates` or restart the app.
+
+For the real shared flow, update `update_manifest.json` in GitHub and push it. That gives all installed users a faster update signal without rebuilding the installer.
+
+This lets you validate the update-check logic without rebuilding the installer every time.
+
 ## Expected folder structure
 
 The selected project root should contain:

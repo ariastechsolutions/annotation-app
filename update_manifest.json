@@ -1,0 +1,8 @@
+{
+  "latest_version": "1.0.9",
+  "release_name": "ATS Annotation Tool 1.0.9",
+  "body": "Baseline manifest for fast update-check testing. Bump latest_version to test the updater without rebuilding the installer.",
+  "release_url": "https://github.com/ariastechsolutions/annotation-app/releases/latest",
+  "download_url": "",
+  "asset_name": ""
+}
