@@ -3,7 +3,6 @@ name: Build and Publish ATS Annotation Tool
 on:
   push:
     branches:
-      - main
       - master
   workflow_dispatch:
 
