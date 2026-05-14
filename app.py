@@ -53,7 +53,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.11"
+APP_VERSION = "1.0.12"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
@@ -2128,6 +2128,7 @@ class AnnotatePage(QWidget):
     selectModeClicked = Signal()
     skipClicked = Signal()
     nextClicked = Signal()
+    tileActivated = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2201,6 +2202,14 @@ class AnnotatePage(QWidget):
         side_layout = QVBoxLayout(side)
         side_layout.setContentsMargins(14, 14, 14, 14)
         side_layout.setSpacing(10)
+        tile_title = QLabel("Tile browser")
+        tile_title.setObjectName("SectionTitle")
+        tile_hint = QLabel("Click a tile to jump to it. Processed tiles are marked and stay in the project state.")
+        tile_hint.setWordWrap(True)
+        tile_hint.setObjectName("PanelHint")
+        self.tile_list = QListWidget()
+        self.tile_list.setObjectName("TileBrowserList")
+        self.tile_list.itemActivated.connect(self.tileActivated.emit)
         side_title = QLabel("Inspector")
         side_title.setObjectName("SectionTitle")
         self.project_summary = QLabel("No project loaded")
@@ -2220,6 +2229,9 @@ class AnnotatePage(QWidget):
         self.debug_note = QLabel("Box list updates live as you draw.")
         self.debug_note.setWordWrap(True)
         self.debug_note.setObjectName("PanelHint")
+        side_layout.addWidget(tile_title)
+        side_layout.addWidget(tile_hint)
+        side_layout.addWidget(self.tile_list, 1)
         side_layout.addWidget(side_title)
         side_layout.addWidget(self.project_summary)
         side_layout.addWidget(self.box_list, 1)
@@ -2243,6 +2255,22 @@ class AnnotatePage(QWidget):
 
     def set_project_summary(self, text: str):
         self.project_summary.setText(text)
+
+    def set_tiles(self, tiles: list[dict], current_index: int):
+        self.tile_list.blockSignals(True)
+        self.tile_list.clear()
+        for idx, tile in enumerate(tiles):
+            processed = bool(tile.get("processed"))
+            last_tile = bool(tile.get("last_processed"))
+            status = "processed" if processed else "pending"
+            if last_tile:
+                status = "last processed"
+            item = QListWidgetItem(f"{tile['name']}  [{status}]")
+            item.setData(Qt.UserRole, idx)
+            if idx == current_index:
+                item.setSelected(True)
+            self.tile_list.addItem(item)
+        self.tile_list.blockSignals(False)
 
     def set_boxes(self, boxes: list[dict], selected_box_id: int | None):
         self.box_list.blockSignals(True)
@@ -2535,6 +2563,7 @@ class MainWindow(QMainWindow):
         self.annotate_page.next_button.clicked.connect(self.enter_metadata_phase)
         self.annotate_page.edit_button.clicked.connect(self.edit_selected_box)
         self.annotate_page.delete_button.clicked.connect(self.delete_selected_box)
+        self.annotate_page.tileActivated.connect(self._annotate_tile_activated)
         self.annotate_page.box_list.itemSelectionChanged.connect(self._annotate_list_changed)
 
         self.metadata_page.back_button.clicked.connect(self.back_to_annotation)
@@ -3187,6 +3216,15 @@ class MainWindow(QMainWindow):
         sar_boxes = [box_to_dict(box, "sar") for box in tile.annotations]
         optical_boxes = [box_to_dict(box, "optical") for box in tile.annotations]
         preview_sizes = {kind: preview_size_for_quality(tile.shared_bounds, self._preview_quality) for kind in ["sar", "optical", "meta"]}
+        if hasattr(self.annotate_page, "set_tiles"):
+            tile_rows = []
+            for idx, (sar_path, _opt_path) in enumerate(self.tile_refs):
+                tile_rows.append({
+                    "name": Path(sar_path).stem,
+                    "processed": Path(sar_path).stem in self.processed_tiles,
+                    "last_processed": Path(sar_path).stem == self._last_processed_tile,
+                })
+            self.annotate_page.set_tiles(tile_rows, self.current_index)
         if self.phase == "annotate":
             sar_image = render_preview_image(
                 str(tile.sar_path),
@@ -3493,6 +3531,14 @@ class MainWindow(QMainWindow):
         box_id = item.data(Qt.UserRole)
         self.on_box_selected(box_id)
 
+    def _annotate_tile_activated(self, item):
+        if item is None:
+            return
+        index = item.data(Qt.UserRole)
+        if index is None:
+            return
+        self.jump_to_tile(int(index))
+
     def _metadata_box_changed(self, *args):
         tile, state, box = self._current_selected_box()
         if tile is None or box is None:
@@ -3611,6 +3657,19 @@ class MainWindow(QMainWindow):
         self.view_bounds = bounds_to_dict(next_record["shared_bounds"])
         self.tool_mode = "select"
         self._set_phase("annotate")
+        self._save_project_state()
+        self.refresh_views()
+
+    def jump_to_tile(self, index: int):
+        if not self.tile_refs:
+            return
+        index = max(0, min(int(index), len(self.tile_refs) - 1))
+        self.current_index = index
+        self.tool_mode = "select"
+        self._set_phase("annotate")
+        tile, _ = self.current_tile_state()
+        if tile is not None:
+            self.view_bounds = bounds_to_dict(tile.shared_bounds)
         self._save_project_state()
         self.refresh_views()
 
