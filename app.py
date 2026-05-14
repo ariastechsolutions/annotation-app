@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import ctypes
 import sys
@@ -52,7 +53,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.10"
+APP_VERSION = "1.0.11"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
@@ -2713,10 +2714,44 @@ class MainWindow(QMainWindow):
         if not installer_path.is_file():
             self._on_update_download_failed("Downloaded installer file was not found.")
             return
-        self._update_status("Launching ATS update installer...")
+        self._update_status("Preparing ATS update installer...")
+        self._set_update_log("update: waiting for app to exit")
+        if not self._launch_installer_after_exit(installer_path):
+            self._on_update_download_failed("Could not start the update launcher.")
+            return
         self._set_update_log("update: launching installer")
-        QProcess.startDetached(str(installer_path), [], str(installer_path.parent))
-        QTimer.singleShot(250, QApplication.instance().quit)
+        QApplication.processEvents()
+        os._exit(0)
+
+    def _launch_installer_after_exit(self, installer_path: Path) -> bool:
+        temp_root = Path(tempfile.gettempdir()) / "ATS_Annotation_Updates"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        script_path = temp_root / f"launch_update_{os.getpid()}.ps1"
+        script_path.write_text(
+            "\n".join(
+                [
+                    f'$pidToWait = {os.getpid()}',
+                    f'$installer = "{str(installer_path)}"',
+                    'while (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 300 }',
+                    'Start-Process -FilePath $installer',
+                ]
+            ),
+            encoding="utf-8",
+        )
+        started = QProcess.startDetached(
+            "powershell",
+            [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+                str(script_path),
+            ],
+            str(temp_root),
+        )
+        return bool(started)
 
     def _project_state_path(self, output_dir: str | Path | None = None):
         root = output_dir if output_dir is not None else self.output_dir
