@@ -52,7 +52,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.7"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
@@ -308,6 +308,13 @@ def apply_theme(app: QApplication, t: dict) -> None:
         QPushButton#ModeToggle:hover {{
             background-color: {t["bg3"]};
             color: {t["text_primary"]};
+        }}
+        QLabel#UpdateLog {{
+            background: transparent;
+            color: {t["text_secondary"]};
+            font-size: 11px;
+            font-family: "DM Mono", monospace;
+            padding: 0 4px;
         }}
         QLabel#VersionPill {{
             background: {t["bg2"]};
@@ -2420,6 +2427,10 @@ class MainWindow(QMainWindow):
         self.update_button.clicked.connect(lambda: self.check_for_updates(True))
         top_layout.addWidget(self.update_button)
 
+        self.update_log = QLabel("update: idle")
+        self.update_log.setObjectName("UpdateLog")
+        top_layout.addWidget(self.update_log)
+
         self.version_label = QLabel(f"v{APP_VERSION}")
         self.version_label.setObjectName("VersionPill")
         top_layout.addWidget(self.version_label)
@@ -2488,11 +2499,16 @@ class MainWindow(QMainWindow):
     def _update_status(self, text: str):
         self.status.showMessage(text)
 
+    def _set_update_log(self, text: str):
+        if hasattr(self, "update_log") and self.update_log is not None:
+            self.update_log.setText(text)
+
     def check_for_updates(self, show_dialog: bool = False):
         if self._update_check_started:
             return
         self._update_check_started = True
         self._update_status("Checking ATS updates...")
+        self._set_update_log("update: checking...")
         self._update_show_dialog = show_dialog
         self._update_thread = QThread(self)
         self._update_worker = UpdateCheckWorker(APP_VERSION)
@@ -2508,7 +2524,8 @@ class MainWindow(QMainWindow):
         self._update_thread.start()
 
     def _on_update_check_failed(self, message: str):
-        self._update_status("Ready")
+        self._update_status("Update check failed")
+        self._set_update_log(f"update: failed - {message}")
         self.update_button.setText("check updates")
         self.update_button.setEnabled(True)
         self._update_check_started = False
@@ -2521,13 +2538,22 @@ class MainWindow(QMainWindow):
 
     def _on_update_check_finished(self, payload):
         self._update_status("Ready")
-        self.update_button.setText("check updates")
         self.update_button.setEnabled(True)
         self._update_check_started = False
+        self.update_button.setText("check updates")
         show_dialog = getattr(self, "_update_show_dialog", False)
         if not isinstance(payload, dict) or not payload.get("available"):
+            status = str(payload.get("status", "")).strip() if isinstance(payload, dict) else ""
+            reason = str(payload.get("message", "")).strip() if isinstance(payload, dict) else ""
+            if status == "up_to_date":
+                self._set_update_log(f"update: up to date ({payload.get('latest_version', APP_VERSION)})")
+            elif status == "no_release":
+                self._set_update_log("update: no GitHub release yet")
+            elif status == "invalid_release":
+                self._set_update_log("update: invalid GitHub release")
+            else:
+                self._set_update_log("update: no update found")
             if show_dialog and isinstance(payload, dict):
-                reason = str(payload.get("message", "")).strip()
                 if reason:
                     QMessageBox.information(self, "ATS update status", reason)
             return
@@ -2536,6 +2562,7 @@ class MainWindow(QMainWindow):
         body = str(payload.get("body", "")).strip()
         download_url = str(payload.get("download_url", "")).strip()
         html_url = str(payload.get("html_url", "")).strip()
+        self._set_update_log(f"update: available {latest_version}")
         message = (
             f"ATS Annotation Tool {latest_version} is available.\n\n"
             f"You are running {APP_VERSION}.\n\n"
@@ -2566,6 +2593,7 @@ class MainWindow(QMainWindow):
 
     def _download_and_install_update(self, url: str, latest_version: str):
         self._update_status(f"Downloading ATS update {latest_version}...")
+        self._set_update_log(f"update: downloading {latest_version}")
         self.update_button.setEnabled(False)
         temp_root = Path(tempfile.gettempdir()) / "ATS_Annotation_Updates"
         filename = Path(urllib.parse.urlparse(url).path).name or "ATS_Annotation_Update.exe"
@@ -2584,7 +2612,8 @@ class MainWindow(QMainWindow):
         self._download_thread.start()
 
     def _on_update_download_failed(self, message: str):
-        self._update_status("Ready")
+        self._update_status("Update download failed")
+        self._set_update_log(f"update: download failed - {message}")
         self.update_button.setEnabled(True)
         QMessageBox.warning(
             self,
@@ -2597,6 +2626,7 @@ class MainWindow(QMainWindow):
             self._on_update_download_failed("Downloaded installer file was not found.")
             return
         self._update_status("Launching ATS update installer...")
+        self._set_update_log("update: launching installer")
         QProcess.startDetached(str(installer_path), [], str(installer_path.parent))
         QTimer.singleShot(250, QApplication.instance().quit)
 

@@ -1,5 +1,5 @@
 #define MyAppName "ATS Annotation Tool"
-#define MyAppVersion "1.0.4"
+#define MyAppVersion "1.0.7"
 #define MyAppPublisher "Aria's Tech Solutions"
 #define MyAppExeName "ATS_Annotation_Tool.exe"
 
