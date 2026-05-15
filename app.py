@@ -20,7 +20,7 @@ from rasterio.features import rasterize
 from rasterio.transform import from_bounds
 from rasterio.warp import Resampling, reproject, transform_bounds
 from shapely.geometry import Polygon, mapping, shape
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal, QObject, QThread, QProcess, QUrl
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal, QObject, QThread, QProcess, QUrl
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QImage, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSlider,
     QScrollArea,
     QDoubleSpinBox,
     QSplitter,
@@ -53,7 +54,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.12"
+APP_VERSION = "1.0.13"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
@@ -208,6 +209,23 @@ def apply_theme(app: QApplication, t: dict) -> None:
         QCheckBox::indicator:checked {{
             background: {t["accent_dim"]};
             border-color: {t["accent_border"]};
+        }}
+        QSlider::groove:horizontal {{
+            background: {t["bg3"]};
+            border: 1px solid {t["border"]};
+            height: 6px;
+            border-radius: 3px;
+        }}
+        QSlider::sub-page:horizontal {{
+            background: {t["accent_dim"]};
+            border-radius: 3px;
+        }}
+        QSlider::handle:horizontal {{
+            background: {t["accent"]};
+            border: 1px solid {t["accent_border"]};
+            width: 14px;
+            margin: -6px 0;
+            border-radius: 7px;
         }}
         QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus, QListWidget:focus {{
             border-color: {t["accent_border"]};
@@ -927,14 +945,16 @@ def preview_size_for_quality(bounds, quality: str):
     return preview_size_for_bounds(bounds, max_width=1200, max_height=900)
 
 
-def stretch_to_uint8(array: np.ndarray) -> np.ndarray:
+def stretch_to_uint8(array: np.ndarray, low_pct: float = 2.0, high_pct: float = 98.0) -> np.ndarray:
     data = np.asarray(array, dtype=np.float32)
     valid = np.isfinite(data)
     if not np.any(valid):
         return np.zeros(data.shape, dtype=np.uint8)
     values = data[valid]
-    low = float(np.percentile(values, 2))
-    high = float(np.percentile(values, 98))
+    low_pct = max(0.0, min(100.0, float(low_pct)))
+    high_pct = max(low_pct + 0.01, min(100.0, float(high_pct)))
+    low = float(np.percentile(values, low_pct))
+    high = float(np.percentile(values, high_pct))
     if not np.isfinite(low) or not np.isfinite(high) or high <= low:
         low = float(np.min(values))
         high = float(np.max(values))
@@ -962,6 +982,8 @@ def render_preview_image(
     top: float,
     width: int,
     height: int,
+    low_pct: float = 2.0,
+    high_pct: float = 98.0,
 ):
     record = load_tile_pair(sar_path_str, optical_path_str)
     view_bounds = {"left": left, "bottom": bottom, "right": right, "top": top}
@@ -992,14 +1014,33 @@ def render_preview_image(
             resampling=Resampling.bilinear,
         )
     if bands == 1:
-        gray = stretch_to_uint8(destination[0])
+        gray = stretch_to_uint8(destination[0], low_pct, high_pct)
         rgb = np.repeat(gray[:, :, None], 3, axis=2)
     else:
         rgb_bands = destination[:3]
         if rgb_bands.shape[0] < 3:
             rgb_bands = np.repeat(rgb_bands, 3, axis=0)[:3]
-        rgb = np.transpose(np.stack([stretch_to_uint8(band) for band in rgb_bands], axis=0), (1, 2, 0))
+        rgb = np.transpose(np.stack([stretch_to_uint8(band, low_pct, high_pct) for band in rgb_bands], axis=0), (1, 2, 0))
     return rgb_array_to_qimage(rgb)
+
+
+def composite_images(base_image: QImage | None, overlay_image: QImage | None, opacity: float) -> QImage | None:
+    if base_image is None or base_image.isNull():
+        return overlay_image.copy() if overlay_image is not None and not overlay_image.isNull() else None
+    if overlay_image is None or overlay_image.isNull():
+        return base_image.copy()
+    opacity = max(0.0, min(1.0, float(opacity)))
+    if base_image.size() != overlay_image.size():
+        overlay_image = overlay_image.scaled(base_image.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    result = QImage(base_image.size(), QImage.Format_ARGB32_Premultiplied)
+    result.fill(Qt.transparent)
+    painter = QPainter(result)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+    painter.drawImage(0, 0, base_image)
+    painter.setOpacity(opacity)
+    painter.drawImage(0, 0, overlay_image)
+    painter.end()
+    return result
 
 
 def box_to_dict(box: BoxAnnotation, image_kind: str = "sar"):
@@ -1782,6 +1823,112 @@ class MetadataRowWidget(QFrame):
         super().leaveEvent(event)
 
 
+class RangeSlider(QWidget):
+    valuesChanged = Signal(int, int)
+
+    def __init__(self, minimum: int = 0, maximum: int = 100, low: int = 2, high: int = 98, parent=None):
+        super().__init__(parent)
+        self._minimum = int(minimum)
+        self._maximum = max(int(maximum), self._minimum + 1)
+        self._low = max(self._minimum, min(int(low), self._maximum))
+        self._high = max(self._low, min(int(high), self._maximum))
+        self._active_handle = None
+        self.setMouseTracking(True)
+        self.setMinimumHeight(34)
+
+    def sizeHint(self):
+        return QSize(240, 34)
+
+    def minimumValue(self):
+        return self._low
+
+    def maximumValue(self):
+        return self._high
+
+    def setValues(self, low: int, high: int):
+        low = max(self._minimum, min(int(low), self._maximum))
+        high = max(self._minimum, min(int(high), self._maximum))
+        if high < low:
+            low, high = high, low
+        changed = low != self._low or high != self._high
+        self._low, self._high = low, high
+        if changed:
+            self.valuesChanged.emit(self._low, self._high)
+            self.update()
+
+    def _bar_rect(self):
+        return QRectF(14, self.height() / 2 - 4, max(1, self.width() - 28), 8)
+
+    def _value_to_pos(self, value: int):
+        bar = self._bar_rect()
+        span = max(1e-9, self._maximum - self._minimum)
+        ratio = (value - self._minimum) / span
+        return bar.left() + ratio * bar.width()
+
+    def _pos_to_value(self, x: float):
+        bar = self._bar_rect()
+        ratio = (x - bar.left()) / max(1e-9, bar.width())
+        value = self._minimum + ratio * (self._maximum - self._minimum)
+        return int(round(max(self._minimum, min(self._maximum, value))))
+
+    def _handle_rect(self, value: int):
+        x = self._value_to_pos(value)
+        return QRectF(x - 7, self.height() / 2 - 10, 14, 20)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        palette = self.palette()
+        text_color = palette.color(QPalette.Text)
+        muted = palette.color(QPalette.Mid)
+        accent = palette.color(QPalette.Highlight)
+        bar = self._bar_rect()
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(muted))
+        painter.drawRoundedRect(bar, 4, 4)
+        low_x = self._value_to_pos(self._low)
+        high_x = self._value_to_pos(self._high)
+        selected = QRectF(low_x, bar.top(), max(1, high_x - low_x), bar.height())
+        painter.setBrush(QColor(accent))
+        painter.drawRoundedRect(selected, 4, 4)
+        for value in [self._low, self._high]:
+            handle = self._handle_rect(value)
+            painter.setBrush(QColor(palette.color(QPalette.Base)))
+            painter.setPen(QPen(QColor(accent), 1.4))
+            painter.drawEllipse(handle)
+        painter.setPen(QColor(text_color))
+        painter.setFont(QFont("DM Mono", 8))
+        painter.drawText(0, 0, self.width(), 14, Qt.AlignLeft | Qt.AlignTop, str(self._low))
+        painter.drawText(0, 0, self.width(), 14, Qt.AlignRight | Qt.AlignTop, str(self._high))
+        painter.end()
+
+    def mousePressEvent(self, event):
+        low_rect = self._handle_rect(self._low)
+        high_rect = self._handle_rect(self._high)
+        low_dist = abs(event.position().x() - low_rect.center().x())
+        high_dist = abs(event.position().x() - high_rect.center().x())
+        if low_rect.contains(event.position()) or low_dist <= high_dist:
+            self._active_handle = "low"
+        else:
+            self._active_handle = "high"
+        self._move_active_handle(event.position().x())
+
+    def mouseMoveEvent(self, event):
+        if self._active_handle is None:
+            return
+        self._move_active_handle(event.position().x())
+
+    def mouseReleaseEvent(self, event):
+        self._active_handle = None
+
+    def _move_active_handle(self, x: float):
+        value = self._pos_to_value(x)
+        if self._active_handle == "low":
+            self.setValues(value, self._high)
+        elif self._active_handle == "high":
+            self.setValues(self._low, value)
+
+
 class SetupPage(QWidget):
     loadRequested = Signal(dict)
     metadataChanged = Signal()
@@ -2187,6 +2334,7 @@ class AnnotatePage(QWidget):
         viewer_layout = QVBoxLayout(viewer_frame)
         viewer_layout.setContentsMargins(12, 12, 12, 12)
         viewer_layout.setSpacing(10)
+        self.viewer_stack = QStackedWidget()
         panes = QSplitter(Qt.Horizontal)
         panes.setChildrenCollapsible(False)
         self.sar_pane = ImagePane("SAR Tile", "sar")
@@ -2195,7 +2343,18 @@ class AnnotatePage(QWidget):
         panes.addWidget(self.optical_pane)
         panes.setStretchFactor(0, 1)
         panes.setStretchFactor(1, 1)
-        viewer_layout.addWidget(panes)
+        side_by_side = QFrame()
+        side_by_side_layout = QVBoxLayout(side_by_side)
+        side_by_side_layout.setContentsMargins(0, 0, 0, 0)
+        side_by_side_layout.addWidget(panes)
+        self.overlap_pane = ImagePane("Overlap View", "optical")
+        overlap_frame = QFrame()
+        overlap_layout = QVBoxLayout(overlap_frame)
+        overlap_layout.setContentsMargins(0, 0, 0, 0)
+        overlap_layout.addWidget(self.overlap_pane)
+        self.viewer_stack.addWidget(side_by_side)
+        self.viewer_stack.addWidget(overlap_frame)
+        viewer_layout.addWidget(self.viewer_stack)
 
         side = QFrame()
         side.setObjectName("InspectorPanel")
@@ -2210,6 +2369,49 @@ class AnnotatePage(QWidget):
         self.tile_list = QListWidget()
         self.tile_list.setObjectName("TileBrowserList")
         self.tile_list.itemActivated.connect(self.tileActivated.emit)
+        side_layout.addWidget(tile_title)
+        side_layout.addWidget(tile_hint)
+        side_layout.addWidget(self.tile_list, 1)
+        compare_title = QLabel("Comparison view")
+        compare_title.setObjectName("SectionTitle")
+        self.overlap_toggle = QPushButton("Overlap view")
+        self.overlap_toggle.setCheckable(True)
+        self.overlap_toggle.setObjectName("ModeChipSelect")
+        self.base_combo = QComboBox()
+        self.base_combo.addItem("Optical base", "optical")
+        self.base_combo.addItem("SAR base", "sar")
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(0, 100)
+        self.opacity_slider.setValue(45)
+        self.opacity_value = QLabel("45%")
+        self.opacity_value.setObjectName("MutedText")
+        compare_row = QHBoxLayout()
+        compare_row.addWidget(QLabel("Base"))
+        compare_row.addWidget(self.base_combo, 1)
+        opacity_row = QHBoxLayout()
+        self.opacity_caption = QLabel("SAR opacity")
+        opacity_row.addWidget(self.opacity_caption)
+        opacity_row.addWidget(self.opacity_slider, 1)
+        opacity_row.addWidget(self.opacity_value)
+        side_layout.addWidget(compare_title)
+        side_layout.addWidget(self.overlap_toggle)
+        side_layout.addLayout(compare_row)
+        side_layout.addLayout(opacity_row)
+
+        contrast_title = QLabel("SAR contrast stretch")
+        contrast_title.setObjectName("SectionTitle")
+        self.contrast_range = RangeSlider(0, 100, 2, 98)
+        self.contrast_label = QLabel("2 - 98")
+        self.contrast_label.setObjectName("MutedText")
+        contrast_hint = QLabel("Drag both ends to adjust the SAR stretch used in previews and overlap mode.")
+        contrast_hint.setWordWrap(True)
+        contrast_hint.setObjectName("PanelHint")
+        contrast_row = QHBoxLayout()
+        contrast_row.addWidget(self.contrast_range, 1)
+        contrast_row.addWidget(self.contrast_label)
+        side_layout.addWidget(contrast_title)
+        side_layout.addLayout(contrast_row)
+        side_layout.addWidget(contrast_hint)
         side_title = QLabel("Inspector")
         side_title.setObjectName("SectionTitle")
         self.project_summary = QLabel("No project loaded")
@@ -2232,6 +2434,45 @@ class AnnotatePage(QWidget):
         side_layout.addWidget(tile_title)
         side_layout.addWidget(tile_hint)
         side_layout.addWidget(self.tile_list, 1)
+        compare_title = QLabel("Comparison view")
+        compare_title.setObjectName("SectionTitle")
+        self.overlap_toggle = QPushButton("Overlap view")
+        self.overlap_toggle.setCheckable(True)
+        self.overlap_toggle.setObjectName("ModeChipSelect")
+        self.base_combo = QComboBox()
+        self.base_combo.addItem("Optical base", "optical")
+        self.base_combo.addItem("SAR base", "sar")
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(0, 100)
+        self.opacity_slider.setValue(45)
+        self.opacity_value = QLabel("45%")
+        self.opacity_value.setObjectName("MutedText")
+        compare_row = QHBoxLayout()
+        compare_row.addWidget(QLabel("Base"))
+        compare_row.addWidget(self.base_combo, 1)
+        opacity_row = QHBoxLayout()
+        opacity_row.addWidget(QLabel("SAR opacity"))
+        opacity_row.addWidget(self.opacity_slider, 1)
+        opacity_row.addWidget(self.opacity_value)
+        side_layout.addWidget(compare_title)
+        side_layout.addWidget(self.overlap_toggle)
+        side_layout.addLayout(compare_row)
+        side_layout.addLayout(opacity_row)
+
+        contrast_title = QLabel("SAR contrast stretch")
+        contrast_title.setObjectName("SectionTitle")
+        self.contrast_range = RangeSlider(0, 100, 2, 98)
+        self.contrast_label = QLabel("2 - 98")
+        self.contrast_label.setObjectName("MutedText")
+        contrast_hint = QLabel("Drag both ends to adjust the SAR stretch used in previews and overlap mode.")
+        contrast_hint.setWordWrap(True)
+        contrast_hint.setObjectName("PanelHint")
+        contrast_row = QHBoxLayout()
+        contrast_row.addWidget(self.contrast_range, 1)
+        contrast_row.addWidget(self.contrast_label)
+        side_layout.addWidget(contrast_title)
+        side_layout.addLayout(contrast_row)
+        side_layout.addWidget(contrast_hint)
         side_layout.addWidget(side_title)
         side_layout.addWidget(self.project_summary)
         side_layout.addWidget(self.box_list, 1)
@@ -2466,11 +2707,17 @@ class MainWindow(QMainWindow):
         self._full_quality_timer.setSingleShot(True)
         self._full_quality_timer.setInterval(180)
         self._full_quality_timer.timeout.connect(self._restore_full_quality)
+        self._render_refresh_timer = QTimer(self)
+        self._render_refresh_timer.setSingleShot(True)
+        self._render_refresh_timer.setInterval(60)
+        self._render_refresh_timer.timeout.connect(self.refresh_views)
         self._syncing_split_toggle = False
         self._restoring_setup_state = False
         self._state_save_pending = False
         self._startup_recent_prompt_done = False
         self._restored_tile_states = {}
+        self._sar_contrast_low = 2
+        self._sar_contrast_high = 98
         self._update_check_started = False
         self._update_thread = None
         self._update_worker = None
@@ -2565,6 +2812,10 @@ class MainWindow(QMainWindow):
         self.annotate_page.delete_button.clicked.connect(self.delete_selected_box)
         self.annotate_page.tileActivated.connect(self._annotate_tile_activated)
         self.annotate_page.box_list.itemSelectionChanged.connect(self._annotate_list_changed)
+        self.annotate_page.overlap_toggle.toggled.connect(self._comparison_mode_changed)
+        self.annotate_page.base_combo.currentIndexChanged.connect(self._comparison_settings_changed)
+        self.annotate_page.opacity_slider.valueChanged.connect(self._comparison_settings_changed)
+        self.annotate_page.contrast_range.valuesChanged.connect(self._contrast_range_changed)
 
         self.metadata_page.back_button.clicked.connect(self.back_to_annotation)
         self.metadata_page.save_next_button.clicked.connect(self.save_and_next_tile)
@@ -2581,7 +2832,7 @@ class MainWindow(QMainWindow):
             else:
                 widget.valueChanged.connect(self._metadata_field_changed)
 
-        for pane in [self.annotate_page.sar_pane, self.annotate_page.optical_pane, self.metadata_page.sar_pane]:
+        for pane in [self.annotate_page.sar_pane, self.annotate_page.optical_pane, self.annotate_page.overlap_pane, self.metadata_page.sar_pane]:
             pane.viewChanged.connect(self.on_view_changed)
             pane.boxDrawn.connect(self.on_box_drawn)
             pane.boxEdited.connect(self.on_box_edited)
@@ -3199,12 +3450,41 @@ class MainWindow(QMainWindow):
         self._refresh_pending = True
         QTimer.singleShot(0, self.refresh_views)
 
+    def _schedule_render_refresh(self):
+        self._render_refresh_timer.start()
+
     def _schedule_full_quality_restore(self):
         self._full_quality_timer.start()
 
     def _restore_full_quality(self):
         self._preview_quality = "full"
         self.refresh_views()
+
+    def _comparison_base_kind(self):
+        if not hasattr(self.annotate_page, "base_combo"):
+            return "optical"
+        return str(self.annotate_page.base_combo.currentData() or "optical")
+
+    def _comparison_mode_changed(self, checked: bool):
+        if hasattr(self.annotate_page, "viewer_stack"):
+            self.annotate_page.viewer_stack.setCurrentIndex(1 if checked else 0)
+        self._schedule_render_refresh()
+
+    def _comparison_settings_changed(self, *args):
+        if hasattr(self.annotate_page, "opacity_value"):
+            self.annotate_page.opacity_value.setText(f"{self.annotate_page.opacity_slider.value()}%")
+        if hasattr(self.annotate_page, "opacity_caption") and hasattr(self.annotate_page, "base_combo"):
+            base_kind = str(self.annotate_page.base_combo.currentData() or "optical")
+            overlay_label = "SAR opacity" if base_kind == "optical" else "Optical opacity"
+            self.annotate_page.opacity_caption.setText(overlay_label)
+        self._schedule_render_refresh()
+
+    def _contrast_range_changed(self, low: int, high: int):
+        self._sar_contrast_low = int(low)
+        self._sar_contrast_high = int(high)
+        if hasattr(self.annotate_page, "contrast_label"):
+            self.annotate_page.contrast_label.setText(f"{low} - {high}")
+        self._schedule_render_refresh()
 
     def refresh_views(self):
         self._refresh_pending = False
@@ -3216,6 +3496,9 @@ class MainWindow(QMainWindow):
         sar_boxes = [box_to_dict(box, "sar") for box in tile.annotations]
         optical_boxes = [box_to_dict(box, "optical") for box in tile.annotations]
         preview_sizes = {kind: preview_size_for_quality(tile.shared_bounds, self._preview_quality) for kind in ["sar", "optical", "meta"]}
+        compare_mode = bool(getattr(self.annotate_page, "overlap_toggle", None) and self.annotate_page.overlap_toggle.isChecked())
+        base_kind = self._comparison_base_kind()
+        base_boxes = optical_boxes if base_kind == "optical" else sar_boxes
         if hasattr(self.annotate_page, "set_tiles"):
             tile_rows = []
             for idx, (sar_path, _opt_path) in enumerate(self.tile_refs):
@@ -3235,6 +3518,8 @@ class MainWindow(QMainWindow):
                 view_bounds["right"],
                 view_bounds["top"],
                 *preview_sizes["sar"],
+                self._sar_contrast_low,
+                self._sar_contrast_high,
             )
             opt_image = render_preview_image(
                 str(tile.sar_path),
@@ -3246,6 +3531,25 @@ class MainWindow(QMainWindow):
                 view_bounds["top"],
                 *preview_sizes["optical"],
             )
+            if compare_mode:
+                overlay_image = sar_image if base_kind == "optical" else opt_image
+                base_image = opt_image if base_kind == "optical" else sar_image
+                opacity = self.annotate_page.opacity_slider.value() / 100.0 if hasattr(self.annotate_page, "opacity_slider") else 0.45
+                composite = composite_images(base_image, overlay_image, opacity)
+                self.annotate_page.overlap_pane.image_kind = base_kind
+                self.annotate_page.overlap_pane.title = f"Overlap View ({base_kind.title()} base)"
+                self.annotate_page.overlap_pane.set_content(
+                    composite,
+                    view_bounds,
+                    base_boxes,
+                    state["selected_box_id"],
+                    self.tool_mode,
+                    draw_debug_bounds(tile),
+                    f"{preview_sizes['sar'][0]}x{preview_sizes['sar'][1]} | base={base_kind} | opacity={int(opacity * 100)}% | {'loaded' if composite is not None and not composite.isNull() else 'decode failed'}",
+                )
+                self.annotate_page.viewer_stack.setCurrentIndex(1)
+            else:
+                self.annotate_page.viewer_stack.setCurrentIndex(0)
             self.annotate_page.sar_pane.set_content(
                 sar_image,
                 view_bounds,
@@ -3280,6 +3584,8 @@ class MainWindow(QMainWindow):
                 view_bounds["right"],
                 view_bounds["top"],
                 *preview_sizes["meta"],
+                self._sar_contrast_low,
+                self._sar_contrast_high,
             )
             self.metadata_page.sar_pane.set_content(
                 sar_image,
