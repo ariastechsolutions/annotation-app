@@ -54,7 +54,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.14"
+APP_VERSION = "1.0.15"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
@@ -964,6 +964,22 @@ def stretch_to_uint8(array: np.ndarray, low_pct: float = 2.0, high_pct: float = 
     return np.clip(stretched, 0, 255).astype(np.uint8)
 
 
+def percentile_bounds(array: np.ndarray, low_pct: float = 2.0, high_pct: float = 98.0) -> tuple[float, float]:
+    data = np.asarray(array, dtype=np.float32)
+    valid = np.isfinite(data)
+    if not np.any(valid):
+        return 0.0, 0.0
+    values = data[valid]
+    low_pct = max(0.0, min(100.0, float(low_pct)))
+    high_pct = max(low_pct + 0.01, min(100.0, float(high_pct)))
+    low = float(np.percentile(values, low_pct))
+    high = float(np.percentile(values, high_pct))
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        low = float(np.min(values))
+        high = float(np.max(values))
+    return low, high
+
+
 def rgb_array_to_qimage(rgb_array: np.ndarray) -> QImage:
     rgb = np.ascontiguousarray(rgb_array.astype(np.uint8))
     height, width, _ = rgb.shape
@@ -984,6 +1000,7 @@ def render_preview_image(
     height: int,
     low_pct: float = 2.0,
     high_pct: float = 98.0,
+    stretch_scope: str = "render",
 ):
     record = load_tile_pair(sar_path_str, optical_path_str)
     view_bounds = {"left": left, "bottom": bottom, "right": right, "top": top}
@@ -1014,7 +1031,14 @@ def render_preview_image(
             resampling=Resampling.bilinear,
         )
     if bands == 1:
-        gray = stretch_to_uint8(destination[0], low_pct, high_pct)
+        if stretch_scope == "source":
+            low, high = percentile_bounds(source[0], low_pct, high_pct)
+            if high <= low:
+                gray = np.zeros((height, width), dtype=np.uint8)
+            else:
+                gray = np.clip((np.clip(destination[0], low, high) - low) / (high - low) * 255.0, 0, 255).astype(np.uint8)
+        else:
+            gray = stretch_to_uint8(destination[0], low_pct, high_pct)
         rgb = np.repeat(gray[:, :, None], 3, axis=2)
     else:
         rgb_bands = destination[:3]
@@ -3488,6 +3512,7 @@ class MainWindow(QMainWindow):
                 *preview_sizes["sar"],
                 self._sar_contrast_low,
                 self._sar_contrast_high,
+                "source",
             )
             opt_image = render_preview_image(
                 str(tile.sar_path),
@@ -3554,6 +3579,7 @@ class MainWindow(QMainWindow):
                 *preview_sizes["meta"],
                 self._sar_contrast_low,
                 self._sar_contrast_high,
+                "source",
             )
             self.metadata_page.sar_pane.set_content(
                 sar_image,
