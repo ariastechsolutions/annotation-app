@@ -54,7 +54,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.15"
+APP_VERSION = "1.0.16"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
@@ -335,6 +335,21 @@ def apply_theme(app: QApplication, t: dict) -> None:
         QPushButton#ModeToggle:hover {{
             background-color: {t["bg3"]};
             color: {t["text_primary"]};
+        }}
+        QPushButton#DangerToggle {{
+            background: rgba(239, 68, 68, 0.12);
+            border: 1px solid rgba(239, 68, 68, 0.38);
+            color: #fca5a5;
+        }}
+        QPushButton#DangerToggle:hover {{
+            background: rgba(239, 68, 68, 0.22);
+            border-color: rgba(239, 68, 68, 0.56);
+            color: #fecaca;
+        }}
+        QPushButton#DangerToggle:checked {{
+            background: rgba(239, 68, 68, 0.32);
+            border-color: rgba(239, 68, 68, 0.72);
+            color: #ffffff;
         }}
         QLabel#UpdateLog {{
             background: transparent;
@@ -668,6 +683,7 @@ class BoxAnnotation:
     ymax: float
     building_status: str = "intact"
     damage_level: str = ""
+    confidence: str = "average"
     split_editing: bool = False
     optical_xmin: float | None = None
     optical_ymin: float | None = None
@@ -730,6 +746,7 @@ class BoxAnnotation:
             "ymax": self.ymax,
             "building_status": self.building_status,
             "damage_level": self.damage_level,
+            "confidence": self.confidence,
             "split_editing": self.split_editing,
             "optical_xmin": self.optical_xmin,
             "optical_ymin": self.optical_ymin,
@@ -750,6 +767,7 @@ class BoxAnnotation:
             ymax=float(payload.get("ymax", 0.0)),
             building_status=str(payload.get("building_status", "intact")),
             damage_level=str(payload.get("damage_level", "")),
+            confidence=str(payload.get("confidence", "average")),
             split_editing=bool(payload.get("split_editing", False)),
             optical_xmin=opt_value("optical_xmin"),
             optical_ymin=opt_value("optical_ymin"),
@@ -879,6 +897,7 @@ def load_tile_pair(sar_path_str: str, optical_path_str: str):
     optical_path = Path(optical_path_str)
     with rasterio.open(sar_path) as sar_src:
         sar_data = sar_src.read()
+        sar_mask = sar_src.dataset_mask()
         sar_transform = sar_src.transform
         sar_crs = sar_src.crs
         sar_width = sar_src.width
@@ -886,6 +905,7 @@ def load_tile_pair(sar_path_str: str, optical_path_str: str):
         sar_bounds = sar_src.bounds
     with rasterio.open(optical_path) as optical_src:
         optical_data = optical_src.read()
+        optical_mask = optical_src.dataset_mask()
         optical_transform = optical_src.transform
         optical_crs = optical_src.crs
         optical_width = optical_src.width
@@ -898,7 +918,9 @@ def load_tile_pair(sar_path_str: str, optical_path_str: str):
         "sar_path": sar_path,
         "optical_path": optical_path,
         "sar_data": sar_data,
+        "sar_mask": sar_mask,
         "optical_data": optical_data,
+        "optical_mask": optical_mask,
         "sar_transform": sar_transform,
         "optical_transform": optical_transform,
         "sar_crs": sar_crs,
@@ -987,6 +1009,13 @@ def rgb_array_to_qimage(rgb_array: np.ndarray) -> QImage:
     return image.copy()
 
 
+def rgba_array_to_qimage(rgba_array: np.ndarray) -> QImage:
+    rgba = np.ascontiguousarray(rgba_array.astype(np.uint8))
+    height, width, _ = rgba.shape
+    image = QImage(rgba.data, width, height, 4 * width, QImage.Format_RGBA8888)
+    return image.copy()
+
+
 @lru_cache(maxsize=128)
 def render_preview_image(
     sar_path_str: str,
@@ -1001,15 +1030,18 @@ def render_preview_image(
     low_pct: float = 2.0,
     high_pct: float = 98.0,
     stretch_scope: str = "render",
+    transparent_nodata: bool = False,
 ):
     record = load_tile_pair(sar_path_str, optical_path_str)
     view_bounds = {"left": left, "bottom": bottom, "right": right, "top": top}
     if image_kind == "sar":
         source = record["sar_data"]
+        source_mask = record.get("sar_mask")
         src_transform = record["sar_transform"]
         src_crs = record["sar_crs"]
     else:
         source = record["optical_data"]
+        source_mask = record.get("optical_mask")
         src_transform = record["optical_transform"]
         src_crs = record["optical_crs"]
     display_crs = record["display_crs"]
@@ -1045,10 +1077,33 @@ def render_preview_image(
         if rgb_bands.shape[0] < 3:
             rgb_bands = np.repeat(rgb_bands, 3, axis=0)[:3]
         rgb = np.transpose(np.stack([stretch_to_uint8(band, low_pct, high_pct) for band in rgb_bands], axis=0), (1, 2, 0))
+    if transparent_nodata and source_mask is not None:
+        alpha_source = np.asarray(source_mask, dtype=np.float32)
+        alpha = np.zeros((height, width), dtype=np.float32)
+        reproject(
+            source=alpha_source,
+            destination=alpha,
+            src_transform=src_transform,
+            src_crs=src_crs,
+            dst_transform=dst_transform,
+            dst_crs=display_crs,
+            resampling=Resampling.nearest,
+        )
+        rgba = np.dstack([rgb, np.where(alpha > 0, 255, 0).astype(np.uint8)])
+        return rgba_array_to_qimage(rgba)
     return rgb_array_to_qimage(rgb)
 
 
 def composite_images(base_image: QImage | None, overlay_image: QImage | None, opacity: float) -> QImage | None:
+    return composite_images_with_transform(base_image, overlay_image, opacity, None)
+
+
+def composite_images_with_transform(
+    base_image: QImage | None,
+    overlay_image: QImage | None,
+    opacity: float,
+    overlay_transform: dict | None,
+) -> QImage | None:
     if base_image is None or base_image.isNull():
         return overlay_image.copy() if overlay_image is not None and not overlay_image.isNull() else None
     if overlay_image is None or overlay_image.isNull():
@@ -1062,7 +1117,22 @@ def composite_images(base_image: QImage | None, overlay_image: QImage | None, op
     painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
     painter.drawImage(0, 0, base_image)
     painter.setOpacity(opacity)
-    painter.drawImage(0, 0, overlay_image)
+    if overlay_transform:
+        scale = float(overlay_transform.get("scale", 1.0))
+        rotation = float(overlay_transform.get("rotation", 0.0))
+        offset_x = float(overlay_transform.get("offset_x", 0.0))
+        offset_y = float(overlay_transform.get("offset_y", 0.0))
+        painter.save()
+        center_x = base_image.width() / 2.0 + offset_x * base_image.width()
+        center_y = base_image.height() / 2.0 + offset_y * base_image.height()
+        painter.translate(center_x, center_y)
+        painter.rotate(rotation)
+        painter.scale(scale, scale)
+        painter.translate(-overlay_image.width() / 2.0, -overlay_image.height() / 2.0)
+        painter.drawImage(0, 0, overlay_image)
+        painter.restore()
+    else:
+        painter.drawImage(0, 0, overlay_image)
     painter.end()
     return result
 
@@ -1077,6 +1147,7 @@ def box_to_dict(box: BoxAnnotation, image_kind: str = "sar"):
         "ymax": ymax,
         "building_status": box.building_status,
         "damage_level": box.damage_level,
+        "confidence": box.confidence,
         "split_editing": box.split_editing,
         "image_kind": image_kind,
     }
@@ -1334,6 +1405,7 @@ def export_tile(tile: TileRecord, output_dir: Path, project_meta: dict):
                         "source": source,
                         "building_status": box.building_status,
                         "damage_level": box.damage_level,
+                        "confidence": box.confidence,
                         "split_editing": box.split_editing,
                         "sar_geometry": {
                             "xmin": box.xmin,
@@ -1372,6 +1444,7 @@ class ImagePane(QFrame):
     boxDrawn = Signal(dict)
     boxEdited = Signal(dict)
     boxSelected = Signal(int)
+    overlayTransformChanged = Signal(dict)
     viewportResized = Signal()
 
     def __init__(self, title: str, image_kind: str = "sar", parent=None):
@@ -1400,6 +1473,7 @@ class ImagePane(QFrame):
         self._theme_bg = "#0e0f11"
         self._theme_text = "#e8eaf0"
         self._theme_border = "rgba(255,255,255,0.08)"
+        self.overlay_edit_state: dict | None = None
 
     def set_content(
         self,
@@ -1410,6 +1484,7 @@ class ImagePane(QFrame):
         mode: str,
         debug_bounds: list[dict],
         status: str,
+        overlay_edit_state: dict | None = None,
     ):
         self.image = image
         self.view_bounds = view_bounds
@@ -1418,6 +1493,7 @@ class ImagePane(QFrame):
         self.mode = mode
         self.debug_bounds = debug_bounds
         self._status = status
+        self.overlay_edit_state = overlay_edit_state or self.overlay_edit_state
         self._update_layer_geometry()
         self._update_image_surface()
         self.overlay.update()
@@ -1566,6 +1642,14 @@ class ImagePane(QFrame):
         self._temp_rect = None
         self.setCursor(Qt.CrossCursor)
 
+    def _start_overlay_drag(self, event):
+        self._interaction = {
+            "kind": "overlay_drag",
+            "start_pos": event.position(),
+            "start_state": dict(self.overlay_edit_state or {}),
+        }
+        self.setCursor(Qt.ClosedHandCursor)
+
     def _start_edit(self, event, box, handle=None):
         self._interaction = {
             "kind": "edit",
@@ -1601,6 +1685,9 @@ class ImagePane(QFrame):
         if not self.view_bounds or event.button() not in (Qt.LeftButton, Qt.MiddleButton):
             return
         if not self._display_rect.contains(event.position()):
+            return
+        if self.mode == "overlay_edit" and event.button() == Qt.LeftButton:
+            self._start_overlay_drag(event)
             return
         world = self._canvas_to_world((event.position().x(), event.position().y()))
         if self.mode == "draw" and event.button() == Qt.LeftButton:
@@ -1645,6 +1732,15 @@ class ImagePane(QFrame):
                 "bottom": start_view["bottom"] + dy * scale_y,
             }
             self.viewChanged.emit(new_view)
+        elif self._interaction["kind"] == "overlay_drag":
+            start_state = dict(self._interaction.get("start_state", {}))
+            dx = event.position().x() - self._interaction["start_pos"].x()
+            dy = event.position().y() - self._interaction["start_pos"].y()
+            width = max(1.0, float(self.image.width() if self.image is not None else self._display_rect.width()))
+            height = max(1.0, float(self.image.height() if self.image is not None else self._display_rect.height()))
+            start_state["offset_x"] = float(start_state.get("offset_x", 0.0)) + dx / width
+            start_state["offset_y"] = float(start_state.get("offset_y", 0.0)) + dy / height
+            self.overlayTransformChanged.emit(start_state)
         elif self._interaction["kind"] == "draw":
             self._interaction["current_world"] = self._canvas_to_world((event.position().x(), event.position().y()))
             self._temp_rect = self._interaction
@@ -1699,6 +1795,8 @@ class ImagePane(QFrame):
             xmin, ymin, xmax, ymax = current["xmin"], current["ymin"], current["xmax"], current["ymax"]
             if xmax - xmin > 0 and ymax - ymin > 0:
                 self.boxEdited.emit(current)
+            self._temp_rect = None
+        elif self._interaction["kind"] == "overlay_drag":
             self._temp_rect = None
         elif self._interaction["kind"] == "pan":
             self.viewChanged.emit(dict(self.view_bounds))
@@ -2297,9 +2395,13 @@ class AnnotatePage(QWidget):
     fitClicked = Signal()
     drawModeClicked = Signal()
     selectModeClicked = Signal()
+    previousClicked = Signal()
     skipClicked = Signal()
     nextClicked = Signal()
     tileActivated = Signal(object)
+    confidenceChanged = Signal(int)
+    sarEditToggled = Signal(bool)
+    sarEditSaved = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2335,14 +2437,16 @@ class AnnotatePage(QWidget):
         self.fit_button = QPushButton("Fit")
         self.draw_button = QPushButton("Draw")
         self.select_button = QPushButton("Select")
+        self.previous_button = QPushButton("Previous")
         self.skip_button = QPushButton("Skip")
         self.next_button = QPushButton("Next")
         self.draw_button.setObjectName("ModeChipDraw")
         self.select_button.setObjectName("ModeChipSelect")
+        self.previous_button.setObjectName("BackBtn")
         self.skip_button.setObjectName("SkipBtn")
         self.next_button.setObjectName("NextBtn")
         self.next_button.setProperty("accent", True)
-        for btn in [self.fit_button, self.draw_button, self.select_button, self.skip_button, self.next_button]:
+        for btn in [self.fit_button, self.draw_button, self.select_button, self.previous_button, self.skip_button, self.next_button]:
             btn.setCursor(Qt.PointingHandCursor)
             actions_block.addWidget(btn)
 
@@ -2441,6 +2545,33 @@ class AnnotatePage(QWidget):
         opacity_layout.addWidget(self.opacity_value)
         self.opacity_widget.setVisible(False)
         side_layout.addWidget(self.opacity_widget)
+        self.confidence_box = QFrame()
+        self.confidence_box.setObjectName("InspectorPanel")
+        confidence_layout = QVBoxLayout(self.confidence_box)
+        confidence_layout.setContentsMargins(10, 10, 10, 10)
+        confidence_layout.setSpacing(6)
+        confidence_title = QLabel("Confidence")
+        confidence_title.setObjectName("SectionTitle")
+        self.confidence_slider = QSlider(Qt.Horizontal)
+        self.confidence_slider.setRange(0, 2)
+        self.confidence_slider.setSingleStep(1)
+        self.confidence_slider.setPageStep(1)
+        self.confidence_slider.setTickPosition(QSlider.TicksBelow)
+        self.confidence_slider.setTickInterval(1)
+        self.confidence_slider.setValue(1)
+        self.confidence_value = QLabel("average")
+        self.confidence_value.setObjectName("MutedText")
+        confidence_marks = QHBoxLayout()
+        confidence_marks.addWidget(QLabel("low"))
+        confidence_marks.addStretch(1)
+        confidence_marks.addWidget(QLabel("average"))
+        confidence_marks.addStretch(1)
+        confidence_marks.addWidget(QLabel("high"))
+        confidence_layout.addWidget(confidence_title)
+        confidence_layout.addWidget(self.confidence_slider)
+        confidence_layout.addWidget(self.confidence_value)
+        confidence_layout.addLayout(confidence_marks)
+        side_layout.addWidget(self.confidence_box)
         side_title = QLabel("Inspector")
         side_title.setObjectName("SectionTitle")
         self.project_summary = QLabel("No project loaded")
@@ -2457,6 +2588,46 @@ class AnnotatePage(QWidget):
         box_actions.addWidget(self.edit_button)
         box_actions.addWidget(self.delete_button)
         self.split_edit_toggle = QCheckBox("Split editing")
+        self.sar_edit_toggle = QPushButton("SAR edit")
+        self.sar_edit_toggle.setCheckable(True)
+        self.sar_edit_toggle.setObjectName("DangerToggle")
+        self.sar_scale_slider = QSlider(Qt.Horizontal)
+        self.sar_scale_slider.setRange(-50, 50)
+        self.sar_scale_slider.setValue(0)
+        self.sar_scale_value = QLabel("100%")
+        self.sar_scale_value.setObjectName("MutedText")
+        self.sar_rotation_slider = QSlider(Qt.Horizontal)
+        self.sar_rotation_slider.setRange(-45, 45)
+        self.sar_rotation_slider.setValue(0)
+        self.sar_rotation_value = QLabel("0 deg")
+        self.sar_rotation_value.setObjectName("MutedText")
+        self.sar_edit_save = QPushButton("Save SAR edit")
+        self.sar_edit_save.setObjectName("DangerToggle")
+        self.sar_edit_widget = QFrame()
+        self.sar_edit_widget.setObjectName("InspectorPanel")
+        sar_edit_layout = QVBoxLayout(self.sar_edit_widget)
+        sar_edit_layout.setContentsMargins(10, 10, 10, 10)
+        sar_edit_layout.setSpacing(8)
+        sar_edit_title = QLabel("SAR alignment")
+        sar_edit_title.setObjectName("SectionTitle")
+        sar_edit_hint = QLabel("Use optical as reference. Drag the SAR layer, then adjust scale and rotation.")
+        sar_edit_hint.setWordWrap(True)
+        sar_edit_hint.setObjectName("PanelHint")
+        scale_row = QHBoxLayout()
+        scale_row.addWidget(QLabel("Scale"))
+        scale_row.addWidget(self.sar_scale_slider, 1)
+        scale_row.addWidget(self.sar_scale_value)
+        rotation_row = QHBoxLayout()
+        rotation_row.addWidget(QLabel("Rotate"))
+        rotation_row.addWidget(self.sar_rotation_slider, 1)
+        rotation_row.addWidget(self.sar_rotation_value)
+        sar_edit_layout.addWidget(sar_edit_title)
+        sar_edit_layout.addWidget(sar_edit_hint)
+        sar_edit_layout.addLayout(scale_row)
+        sar_edit_layout.addLayout(rotation_row)
+        sar_edit_layout.addWidget(self.sar_edit_save)
+        self.sar_edit_toggle.setVisible(False)
+        self.sar_edit_widget.setVisible(False)
         self.debug_note = QLabel("Box list updates live as you draw.")
         self.debug_note.setWordWrap(True)
         self.debug_note.setObjectName("PanelHint")
@@ -2467,6 +2638,8 @@ class AnnotatePage(QWidget):
         side_layout.addWidget(self.project_summary)
         side_layout.addWidget(self.box_list, 1)
         side_layout.addLayout(box_actions)
+        side_layout.addWidget(self.sar_edit_toggle)
+        side_layout.addWidget(self.sar_edit_widget)
         side_layout.addWidget(self.split_edit_toggle)
         side_layout.addWidget(self.debug_note)
 
@@ -2508,7 +2681,9 @@ class AnnotatePage(QWidget):
         self.box_list.clear()
         for box in boxes:
             split_tag = "split" if box.get("split_editing") else "shared"
-            item = QListWidgetItem(f"Box {box['box_id']}  [{box['building_status']}, {box['damage_level']}, {split_tag}]")
+            confidence = box.get("confidence", "average")
+            damage_part = f", {box['damage_level']}" if box.get("building_status") == "damaged" and box.get("damage_level") else ""
+            item = QListWidgetItem(f"Box {box['box_id']}  [{box['building_status']}{damage_part}, {confidence}, {split_tag}]")
             item.setData(Qt.UserRole, box["box_id"])
             self.box_list.addItem(item)
             if box["box_id"] == selected_box_id:
@@ -2646,7 +2821,8 @@ class MetadataPage(QWidget):
             self.box_select.addItem(label, box["box_id"])
             split_tag = "split" if box.get("split_editing") else "shared"
             damage_part = f", {box['damage_level']}" if box["building_status"] == "damaged" and box["damage_level"] else ""
-            item = QListWidgetItem(f"{label}  [{box['building_status']}{damage_part}, {split_tag}]")
+            confidence = box.get("confidence", "average")
+            item = QListWidgetItem(f"{label}  [{box['building_status']}{damage_part}, {confidence}, {split_tag}]")
             item.setData(Qt.UserRole, box["box_id"])
             self.box_list.addItem(item)
             if box["box_id"] == selected_box_id:
@@ -2708,6 +2884,7 @@ class MainWindow(QMainWindow):
         self._restored_tile_states = {}
         self._sar_contrast_low = 2
         self._sar_contrast_high = 98
+        self._sar_edit_mode = False
         self._update_check_started = False
         self._update_thread = None
         self._update_worker = None
@@ -2796,16 +2973,22 @@ class MainWindow(QMainWindow):
         self.annotate_page.fit_button.clicked.connect(self.fit_view)
         self.annotate_page.draw_button.clicked.connect(lambda: self.set_tool_mode("draw"))
         self.annotate_page.select_button.clicked.connect(lambda: self.set_tool_mode("select"))
+        self.annotate_page.previous_button.clicked.connect(self.go_previous_tile)
         self.annotate_page.skip_button.clicked.connect(self.skip_current_tile)
         self.annotate_page.next_button.clicked.connect(self.enter_metadata_phase)
         self.annotate_page.edit_button.clicked.connect(self.edit_selected_box)
         self.annotate_page.delete_button.clicked.connect(self.delete_selected_box)
         self.annotate_page.tileActivated.connect(self._annotate_tile_activated)
         self.annotate_page.box_list.itemSelectionChanged.connect(self._annotate_list_changed)
+        self.annotate_page.confidence_slider.valueChanged.connect(self._confidence_slider_changed)
         self.annotate_page.overlap_toggle.toggled.connect(self._comparison_mode_changed)
         self.annotate_page.base_combo.currentIndexChanged.connect(self._comparison_settings_changed)
         self.annotate_page.opacity_slider.valueChanged.connect(self._comparison_settings_changed)
         self.annotate_page.contrast_range.valuesChanged.connect(self._contrast_range_changed)
+        self.annotate_page.sar_edit_toggle.toggled.connect(self._sar_edit_mode_changed)
+        self.annotate_page.sar_scale_slider.valueChanged.connect(self._sar_edit_transform_changed)
+        self.annotate_page.sar_rotation_slider.valueChanged.connect(self._sar_edit_transform_changed)
+        self.annotate_page.sar_edit_save.clicked.connect(self._save_sar_edit_mode)
 
         self.metadata_page.back_button.clicked.connect(self.back_to_annotation)
         self.metadata_page.save_next_button.clicked.connect(self.save_and_next_tile)
@@ -2828,6 +3011,8 @@ class MainWindow(QMainWindow):
             pane.boxEdited.connect(self.on_box_edited)
             pane.boxSelected.connect(self.on_box_selected)
             pane.viewportResized.connect(self.schedule_refresh)
+            if pane is self.annotate_page.overlap_pane:
+                pane.overlayTransformChanged.connect(self._overlay_transform_changed)
             pane.set_theme(DARK_TOKENS)
 
         self._set_phase("setup")
@@ -3078,6 +3263,19 @@ class MainWindow(QMainWindow):
         self._save_recent_projects()
         self.setup_page.set_recent_projects(self.recent_projects)
 
+    def _default_tile_state(self):
+        return {
+            "annotations": [],
+            "next_box_id": 1,
+            "selected_box_id": None,
+            "sar_edit": {
+                "scale": 1.0,
+                "rotation": 0.0,
+                "offset_x": 0.0,
+                "offset_y": 0.0,
+            },
+        }
+
     def _load_project_state_file(self, output_dir: str | Path | None = None):
         path = self._project_state_path(output_dir)
         if path is None or not path.is_file():
@@ -3093,6 +3291,12 @@ class MainWindow(QMainWindow):
             payload[tile_name] = {
                 "next_box_id": int(state.get("next_box_id", 1)),
                 "selected_box_id": state.get("selected_box_id"),
+                "sar_edit": {
+                    "scale": float(state.get("sar_edit", {}).get("scale", 1.0)),
+                    "rotation": float(state.get("sar_edit", {}).get("rotation", 0.0)),
+                    "offset_x": float(state.get("sar_edit", {}).get("offset_x", 0.0)),
+                    "offset_y": float(state.get("sar_edit", {}).get("offset_y", 0.0)),
+                },
                 "annotations": [box.to_dict() for box in state.get("annotations", [])],
             }
         return payload
@@ -3112,6 +3316,12 @@ class MainWindow(QMainWindow):
                 "annotations": annotations,
                 "next_box_id": next_box_id,
                 "selected_box_id": state.get("selected_box_id"),
+                "sar_edit": {
+                    "scale": float(state.get("sar_edit", {}).get("scale", 1.0)),
+                    "rotation": float(state.get("sar_edit", {}).get("rotation", 0.0)),
+                    "offset_x": float(state.get("sar_edit", {}).get("offset_x", 0.0)),
+                    "offset_y": float(state.get("sar_edit", {}).get("offset_y", 0.0)),
+                },
             }
 
     def _geojson_path_for_tile(self, tile_name: str):
@@ -3153,6 +3363,7 @@ class MainWindow(QMainWindow):
                     "box_id": box_id,
                     "building_status": props.get("building_status", "intact"),
                     "damage_level": props.get("damage_level", ""),
+                    "confidence": props.get("confidence", "average"),
                     "split_editing": bool(props.get("split_editing", False)),
                     "sar": None,
                     "optical": None,
@@ -3185,6 +3396,7 @@ class MainWindow(QMainWindow):
                 ymax=float(sar_bbox[3]),
                 building_status=str(entry.get("building_status", "intact")),
                 damage_level=str(entry.get("damage_level", "")),
+                confidence=str(entry.get("confidence", "average")),
                 split_editing=bool(entry.get("split_editing", False)),
             )
             optical_bbox = entry.get("optical")
@@ -3333,7 +3545,7 @@ class MainWindow(QMainWindow):
             return None, None
         sar_path, optical_path = self.tile_refs[self.current_index]
         record = load_tile_pair(str(sar_path), str(optical_path))
-        state = self.tile_states.setdefault(record["name"], {"annotations": [], "next_box_id": 1, "selected_box_id": None})
+        state = self.tile_states.setdefault(record["name"], self._default_tile_state())
         if not state["annotations"]:
             tile = TileRecord(
                 name=record["name"],
@@ -3453,13 +3665,25 @@ class MainWindow(QMainWindow):
     def _comparison_base_kind(self):
         if not hasattr(self.annotate_page, "base_combo"):
             return "optical"
+        if self._sar_edit_mode:
+            return "optical"
         return str(self.annotate_page.base_combo.currentData() or "optical")
 
     def _comparison_mode_changed(self, checked: bool):
+        if not checked and self._sar_edit_mode:
+            self._set_sar_edit_mode(False)
         if hasattr(self.annotate_page, "viewer_stack"):
             self.annotate_page.viewer_stack.setCurrentIndex(1 if checked else 0)
         if hasattr(self.annotate_page, "opacity_widget"):
             self.annotate_page.opacity_widget.setVisible(bool(checked))
+        if hasattr(self.annotate_page, "sar_edit_toggle"):
+            self.annotate_page.sar_edit_toggle.setVisible(bool(checked))
+        if hasattr(self.annotate_page, "sar_edit_widget"):
+            self.annotate_page.sar_edit_widget.setVisible(bool(checked and self._sar_edit_mode))
+        if checked and hasattr(self.annotate_page, "base_combo"):
+            self.annotate_page.base_combo.setEnabled(not self._sar_edit_mode)
+        if not checked and hasattr(self.annotate_page, "base_combo"):
+            self.annotate_page.base_combo.setEnabled(False)
         self._schedule_render_refresh()
 
     def _comparison_settings_changed(self, *args):
@@ -3477,6 +3701,180 @@ class MainWindow(QMainWindow):
         if hasattr(self.annotate_page, "contrast_label"):
             self.annotate_page.contrast_label.setText(f"{low} - {high}")
         self._schedule_render_refresh()
+
+    def _confidence_label(self, index: int) -> str:
+        return ["low", "average", "high"][max(0, min(2, int(index)))]
+
+    def _confidence_index(self, label: str) -> int:
+        mapping = {"low": 0, "average": 1, "high": 2}
+        return mapping.get(str(label).strip().lower(), 1)
+
+    def _current_confidence_box(self):
+        tile, state, box = self._current_selected_box()
+        return tile, state, box
+
+    def _sync_confidence_control(self, tile: TileRecord | None = None, state: dict | None = None):
+        if tile is None or state is None:
+            tile, state = self.current_tile_state()
+        if tile is None:
+            return
+        box_id = state.get("selected_box_id")
+        if box_id is None and tile.annotations:
+            box_id = tile.annotations[0].box_id
+        box = next((item for item in tile.annotations if item.box_id == box_id), None)
+        if box is None:
+            if hasattr(self.annotate_page, "confidence_slider"):
+                self.annotate_page.confidence_slider.setEnabled(False)
+            if hasattr(self.annotate_page, "confidence_value"):
+                self.annotate_page.confidence_value.setText("average")
+            return
+        slider = getattr(self.annotate_page, "confidence_slider", None)
+        value_label = getattr(self.annotate_page, "confidence_value", None)
+        if slider is None:
+            return
+        slider.setEnabled(not self._sar_edit_mode)
+        slider.blockSignals(True)
+        slider.setValue(self._confidence_index(box.confidence))
+        slider.blockSignals(False)
+        if value_label is not None:
+            value_label.setText(self._confidence_label(slider.value()))
+
+    def _confidence_slider_changed(self, value: int):
+        tile, state, box = self._current_selected_box()
+        if tile is None or box is None:
+            return
+        box.confidence = self._confidence_label(value)
+        if hasattr(self.annotate_page, "confidence_value"):
+            self.annotate_page.confidence_value.setText(box.confidence)
+        self._schedule_project_state_save()
+        self.refresh_views()
+
+    def _overlay_edit_state(self, tile: TileRecord | None = None, state: dict | None = None):
+        if tile is None or state is None:
+            tile, state = self.current_tile_state()
+        if tile is None:
+            return None
+        return state.setdefault(
+            "sar_edit",
+            {
+                "scale": 1.0,
+                "rotation": 0.0,
+                "offset_x": 0.0,
+                "offset_y": 0.0,
+            },
+        )
+
+    def _set_sar_edit_mode(self, enabled: bool):
+        self._sar_edit_mode = bool(enabled)
+        state = None
+        tile = None
+        if self.tile_refs:
+            tile, state = self.current_tile_state()
+        widgets_to_toggle = [
+            getattr(self.annotate_page, "fit_button", None),
+            getattr(self.annotate_page, "draw_button", None),
+            getattr(self.annotate_page, "select_button", None),
+            getattr(self.annotate_page, "previous_button", None),
+            getattr(self.annotate_page, "skip_button", None),
+            getattr(self.annotate_page, "next_button", None),
+            getattr(self.annotate_page, "edit_button", None),
+            getattr(self.annotate_page, "delete_button", None),
+            getattr(self.annotate_page, "tile_list", None),
+            getattr(self.annotate_page, "box_list", None),
+            getattr(self.annotate_page, "split_edit_toggle", None),
+            getattr(self.annotate_page, "confidence_slider", None),
+            getattr(self.annotate_page, "confidence_box", None),
+            getattr(self.annotate_page, "base_combo", None),
+        ]
+        for widget in widgets_to_toggle:
+            if widget is not None:
+                widget.setEnabled(not self._sar_edit_mode)
+        if hasattr(self.annotate_page, "sar_edit_widget"):
+            self.annotate_page.sar_edit_widget.setVisible(self._sar_edit_mode)
+        if self._sar_edit_mode and hasattr(self.annotate_page, "overlap_toggle") and not self.annotate_page.overlap_toggle.isChecked():
+            self.annotate_page.overlap_toggle.blockSignals(True)
+            self.annotate_page.overlap_toggle.setChecked(True)
+            self.annotate_page.overlap_toggle.blockSignals(False)
+        if self._sar_edit_mode and hasattr(self.annotate_page, "base_combo"):
+            self.annotate_page.base_combo.blockSignals(True)
+            try:
+                optical_index = self.annotate_page.base_combo.findData("optical")
+                if optical_index >= 0:
+                    self.annotate_page.base_combo.setCurrentIndex(optical_index)
+            finally:
+                self.annotate_page.base_combo.blockSignals(False)
+        if tile is not None and state is not None:
+            sar_edit = self._overlay_edit_state(tile, state)
+            if sar_edit is not None:
+                if hasattr(self.annotate_page, "sar_scale_slider"):
+                    self.annotate_page.sar_scale_slider.blockSignals(True)
+                    self.annotate_page.sar_scale_slider.setValue(int(round((float(sar_edit.get("scale", 1.0)) - 1.0) * 100)))
+                    self.annotate_page.sar_scale_slider.blockSignals(False)
+                if hasattr(self.annotate_page, "sar_rotation_slider"):
+                    self.annotate_page.sar_rotation_slider.blockSignals(True)
+                    self.annotate_page.sar_rotation_slider.setValue(int(round(float(sar_edit.get("rotation", 0.0)))))
+                    self.annotate_page.sar_rotation_slider.blockSignals(False)
+                if hasattr(self.annotate_page, "sar_scale_value"):
+                    self.annotate_page.sar_scale_value.setText(f"{int(round(float(sar_edit.get('scale', 1.0)) * 100))}%")
+                if hasattr(self.annotate_page, "sar_rotation_value"):
+                    self.annotate_page.sar_rotation_value.setText(f"{int(round(float(sar_edit.get('rotation', 0.0))))} deg")
+        if tile is not None and state is not None:
+            state.setdefault("sar_edit", {"scale": 1.0, "rotation": 0.0, "offset_x": 0.0, "offset_y": 0.0})
+        if not self._sar_edit_mode and state is not None:
+            self._save_project_state()
+        if hasattr(self.annotate_page, "sar_edit_toggle"):
+            self.annotate_page.sar_edit_toggle.blockSignals(True)
+            self.annotate_page.sar_edit_toggle.setChecked(self._sar_edit_mode)
+            self.annotate_page.sar_edit_toggle.blockSignals(False)
+        self.refresh_views()
+
+    def _sar_edit_mode_changed(self, checked: bool):
+        if checked and hasattr(self.annotate_page, "overlap_toggle") and not self.annotate_page.overlap_toggle.isChecked():
+            self.annotate_page.overlap_toggle.setChecked(True)
+        self._set_sar_edit_mode(bool(checked))
+
+    def _sar_edit_transform_changed(self, *args):
+        tile, state = self.current_tile_state()
+        if tile is None or state is None:
+            return
+        sar_edit = self._overlay_edit_state(tile, state)
+        if sar_edit is None:
+            return
+        sar_edit["scale"] = 1.0 + (self.annotate_page.sar_scale_slider.value() / 100.0)
+        sar_edit["rotation"] = float(self.annotate_page.sar_rotation_slider.value())
+        if hasattr(self.annotate_page, "sar_scale_value"):
+            self.annotate_page.sar_scale_value.setText(f"{int(round(sar_edit['scale'] * 100))}%")
+        if hasattr(self.annotate_page, "sar_rotation_value"):
+            self.annotate_page.sar_rotation_value.setText(f"{int(self.annotate_page.sar_rotation_slider.value())} deg")
+        self._schedule_project_state_save()
+        self._schedule_render_refresh()
+
+    def _overlay_transform_changed(self, transform: dict):
+        if not self._sar_edit_mode:
+            return
+        tile, state = self.current_tile_state()
+        if tile is None or state is None:
+            return
+        sar_edit = self._overlay_edit_state(tile, state)
+        if sar_edit is None:
+            return
+        for key in ("scale", "rotation", "offset_x", "offset_y"):
+            if key in transform:
+                sar_edit[key] = float(transform[key])
+        self._schedule_project_state_save()
+        self._schedule_render_refresh()
+
+    def _save_sar_edit_mode(self):
+        tile, state = self.current_tile_state()
+        if tile is None:
+            return
+        self._save_project_state()
+        if hasattr(self.annotate_page, "overlap_toggle"):
+            self.annotate_page.overlap_toggle.blockSignals(True)
+            self.annotate_page.overlap_toggle.setChecked(False)
+            self.annotate_page.overlap_toggle.blockSignals(False)
+        self._set_sar_edit_mode(False)
+        self._comparison_mode_changed(False)
 
     def refresh_views(self):
         self._refresh_pending = False
@@ -3513,6 +3911,7 @@ class MainWindow(QMainWindow):
                 self._sar_contrast_low,
                 self._sar_contrast_high,
                 "source",
+                transparent_nodata=compare_mode,
             )
             opt_image = render_preview_image(
                 str(tile.sar_path),
@@ -3523,12 +3922,14 @@ class MainWindow(QMainWindow):
                 view_bounds["right"],
                 view_bounds["top"],
                 *preview_sizes["optical"],
+                transparent_nodata=compare_mode,
             )
             if compare_mode:
                 overlay_image = sar_image if base_kind == "optical" else opt_image
                 base_image = opt_image if base_kind == "optical" else sar_image
+                overlay_transform = state.get("sar_edit") if self._sar_edit_mode and base_kind == "optical" else None
                 opacity = self.annotate_page.opacity_slider.value() / 100.0 if hasattr(self.annotate_page, "opacity_slider") else 0.45
-                composite = composite_images(base_image, overlay_image, opacity)
+                composite = composite_images_with_transform(base_image, overlay_image, opacity, overlay_transform)
                 self.annotate_page.overlap_pane.image_kind = base_kind
                 self.annotate_page.overlap_pane.title = f"Overlap View ({base_kind.title()} base)"
                 self.annotate_page.overlap_pane.set_content(
@@ -3536,9 +3937,10 @@ class MainWindow(QMainWindow):
                     view_bounds,
                     base_boxes,
                     state["selected_box_id"],
-                    self.tool_mode,
+                    "overlay_edit" if self._sar_edit_mode else self.tool_mode,
                     draw_debug_bounds(tile),
                     f"{preview_sizes['sar'][0]}x{preview_sizes['sar'][1]} | base={base_kind} | opacity={int(opacity * 100)}% | {'loaded' if composite is not None and not composite.isNull() else 'decode failed'}",
+                    state.get("sar_edit"),
                 )
                 self.annotate_page.viewer_stack.setCurrentIndex(1)
             else:
@@ -3567,6 +3969,8 @@ class MainWindow(QMainWindow):
             )
             self.annotate_page.set_boxes(sar_boxes, state["selected_box_id"])
             self._sync_split_edit_toggle(tile, state)
+            self._sync_confidence_control(tile, state)
+            self._sync_annotation_tool_state()
         elif self.phase == "metadata":
             sar_image = render_preview_image(
                 str(tile.sar_path),
@@ -3603,6 +4007,33 @@ class MainWindow(QMainWindow):
         self._update_status(f"Tile {self.current_index + 1} / {len(self.tile_refs)} | {tile.name} | {self.phase}")
         if self._preview_quality == "low":
             self._schedule_full_quality_restore()
+
+    def _sync_annotation_tool_state(self):
+        enabled = not self._sar_edit_mode
+        compare_mode = bool(getattr(self.annotate_page, "overlap_toggle", None) and self.annotate_page.overlap_toggle.isChecked())
+        for widget in [
+            getattr(self.annotate_page, "fit_button", None),
+            getattr(self.annotate_page, "draw_button", None),
+            getattr(self.annotate_page, "select_button", None),
+            getattr(self.annotate_page, "previous_button", None),
+            getattr(self.annotate_page, "skip_button", None),
+            getattr(self.annotate_page, "next_button", None),
+            getattr(self.annotate_page, "edit_button", None),
+            getattr(self.annotate_page, "delete_button", None),
+            getattr(self.annotate_page, "tile_list", None),
+            getattr(self.annotate_page, "box_list", None),
+            getattr(self.annotate_page, "split_edit_toggle", None),
+            getattr(self.annotate_page, "confidence_slider", None),
+            getattr(self.annotate_page, "confidence_box", None),
+        ]:
+            if widget is not None:
+                widget.setEnabled(enabled)
+        if hasattr(self.annotate_page, "base_combo"):
+            self.annotate_page.base_combo.setEnabled(enabled and compare_mode)
+        if hasattr(self.annotate_page, "sar_edit_toggle"):
+            self.annotate_page.sar_edit_toggle.setEnabled(compare_mode)
+        if hasattr(self.annotate_page, "sar_edit_save"):
+            self.annotate_page.sar_edit_save.setEnabled(self._sar_edit_mode)
 
     def _sync_metadata_form(self, tile: TileRecord, state: dict):
         boxes = tile.annotations
@@ -3758,7 +4189,14 @@ class MainWindow(QMainWindow):
         if tile is None:
             return
         image_kind = box_data.get("image_kind", "sar")
-        box = BoxAnnotation(state["next_box_id"], box_data["xmin"], box_data["ymin"], box_data["xmax"], box_data["ymax"])
+        box = BoxAnnotation(
+            state["next_box_id"],
+            box_data["xmin"],
+            box_data["ymin"],
+            box_data["xmax"],
+            box_data["ymax"],
+            confidence=self._confidence_label(self.annotate_page.confidence_slider.value()) if hasattr(self.annotate_page, "confidence_slider") else "average",
+        )
         if self._selected_split_editing(tile, state):
             box.enable_split_editing()
             box.set_geometry(image_kind, box_data["xmin"], box_data["ymin"], box_data["xmax"], box_data["ymax"])
@@ -3876,6 +4314,21 @@ class MainWindow(QMainWindow):
         self.project_metadata = self.setup_page.project_metadata()
         self.disaster_type = self.setup_page.disaster_type.text().strip()
         self._schedule_project_state_save()
+        self.refresh_views()
+
+    def _go_previous_tile(self):
+        if not self.tile_refs:
+            return
+        if self.current_index <= 0:
+            self.current_index = len(self.tile_refs) - 1
+        else:
+            self.current_index -= 1
+        tile, _ = self.current_tile_state()
+        if tile is not None:
+            self.view_bounds = bounds_to_dict(tile.shared_bounds)
+        self.tool_mode = "select"
+        self._set_phase("annotate")
+        self._save_project_state()
         self.refresh_views()
 
     def enter_metadata_phase(self, *args):
