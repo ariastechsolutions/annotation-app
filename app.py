@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.19"
+APP_VERSION = "1.0.20"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
@@ -4189,6 +4189,7 @@ class MainWindow(QMainWindow):
                 view_bounds["right"],
                 view_bounds["top"],
                 *preview_sizes["optical"],
+                transparent_nodata=compare_mode,
             )
             sar_display_image = (
                 render_aligned_sar_preview(

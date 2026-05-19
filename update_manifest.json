@@ -1,6 +1,6 @@
 {
-  "latest_version": "1.0.19",
-  "release_name": "ATS Annotation Tool 1.0.19",
+  "latest_version": "1.0.20",
+  "release_name": "ATS Annotation Tool 1.0.20",
   "body": "Improve sidebar organization, keep the sidebar scrollable, and persist SAR edit transforms across views.",
   "release_url": "https://github.com/ariastechsolutions/annotation-app/releases/latest",
   "download_url": "",
