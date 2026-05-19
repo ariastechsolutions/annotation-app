@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import rasterio
+from affine import Affine
 from pyproj import Transformer
 from rasterio.features import rasterize
 from rasterio.transform import from_bounds
@@ -55,7 +56,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.18"
+APP_VERSION = "1.0.19"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
@@ -1178,6 +1179,104 @@ def apply_display_transform(image: QImage | None, transform_state: dict | None) 
     return result
 
 
+def sar_edit_affine(width: int, height: int, transform_state: dict | None) -> Affine:
+    transform_state = transform_state or {}
+    scale = float(transform_state.get("scale", 1.0))
+    rotation = float(transform_state.get("rotation", 0.0))
+    offset_x = float(transform_state.get("offset_x", 0.0)) * float(width)
+    offset_y = float(transform_state.get("offset_y", 0.0)) * float(height)
+    cx = float(width) / 2.0
+    cy = float(height) / 2.0
+    return (
+        Affine.translation(cx, cy)
+        * Affine.rotation(rotation)
+        * Affine.scale(scale, scale)
+        * Affine.translation(-cx + offset_x, -cy + offset_y)
+    )
+
+
+@lru_cache(maxsize=128)
+def render_aligned_sar_preview(
+    sar_path_str: str,
+    optical_path_str: str,
+    left: float,
+    bottom: float,
+    right: float,
+    top: float,
+    width: int,
+    height: int,
+    low_pct: float = 2.0,
+    high_pct: float = 98.0,
+    stretch_scope: str = "source",
+    transparent_nodata: bool = False,
+    scale: float = 1.0,
+    rotation: float = 0.0,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+):
+    record = load_tile_pair(sar_path_str, optical_path_str)
+    view_bounds = {"left": left, "bottom": bottom, "right": right, "top": top}
+    with rasterio.open(sar_path_str) as sar_src:
+        source = sar_src.read()
+        source_mask = sar_src.dataset_mask()
+        src_transform = sar_src.transform * sar_edit_affine(
+            sar_src.width,
+            sar_src.height,
+            {
+                "scale": scale,
+                "rotation": rotation,
+                "offset_x": offset_x,
+                "offset_y": offset_y,
+            },
+        )
+        src_crs = sar_src.crs
+        if source.ndim == 2:
+            source = source[np.newaxis, :, :]
+        bands = source.shape[0]
+        destination = np.zeros((bands, height, width), dtype=np.float32)
+        dst_transform = from_bounds(left, bottom, right, top, width, height)
+        for band_index in range(bands):
+            reproject(
+                source=source[band_index],
+                destination=destination[band_index],
+                src_transform=src_transform,
+                src_crs=src_crs,
+                dst_transform=dst_transform,
+                dst_crs=record["display_crs"],
+                resampling=Resampling.bilinear,
+            )
+        if bands == 1:
+            if stretch_scope == "source":
+                low, high = percentile_bounds(source[0], low_pct, high_pct)
+                if high <= low:
+                    gray = np.zeros((height, width), dtype=np.uint8)
+                else:
+                    gray = np.clip((np.clip(destination[0], low, high) - low) / (high - low) * 255.0, 0, 255).astype(np.uint8)
+            else:
+                gray = stretch_to_uint8(destination[0], low_pct, high_pct)
+            rgb = np.repeat(gray[:, :, None], 3, axis=2)
+        else:
+            rgb_bands = destination[:3]
+            if rgb_bands.shape[0] < 3:
+                rgb_bands = np.repeat(rgb_bands, 3, axis=0)[:3]
+            rgb = np.transpose(np.stack([stretch_to_uint8(band, low_pct, high_pct) for band in rgb_bands], axis=0), (1, 2, 0))
+        if transparent_nodata and source_mask is not None:
+            alpha_source = np.asarray(source_mask, dtype=np.float32)
+            alpha = np.zeros((height, width), dtype=np.float32)
+            reproject(
+                source=alpha_source,
+                destination=alpha,
+                src_transform=src_transform,
+                src_crs=src_crs,
+                dst_transform=dst_transform,
+                dst_crs=record["display_crs"],
+                resampling=Resampling.nearest,
+            )
+            rgba = np.dstack([rgb, np.where(alpha > 0, 255, 0).astype(np.uint8)])
+            return rgba_array_to_qimage(rgba)
+    return rgb_array_to_qimage(rgb)
+
+
 def box_to_dict(box: BoxAnnotation, image_kind: str = "sar"):
     xmin, ymin, xmax, ymax = box.normalized(image_kind)
     return {
@@ -1478,6 +1577,64 @@ def export_tile(tile: TileRecord, output_dir: Path, project_meta: dict):
         "features": features,
     }
     geojson_path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
+
+
+def save_aligned_sar_raster(
+    source_sar_path: Path,
+    optical_path: Path,
+    output_path: Path,
+    transform_state: dict | None,
+):
+    with rasterio.open(source_sar_path) as sar_src, rasterio.open(optical_path) as optical_src:
+        width = optical_src.width
+        height = optical_src.height
+        dst_transform = optical_src.transform
+        dst_crs = optical_src.crs
+        src_transform = sar_src.transform * sar_edit_affine(sar_src.width, sar_src.height, transform_state)
+        src_crs = sar_src.crs
+        count = sar_src.count
+        dtype = sar_src.dtypes[0]
+        source_mask = sar_src.dataset_mask()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        profile = sar_src.profile.copy()
+        profile.update(
+            driver="GTiff",
+            width=width,
+            height=height,
+            transform=dst_transform,
+            crs=dst_crs,
+            count=count,
+            dtype=dtype,
+            compress="lzw",
+            nodata=sar_src.nodata,
+        )
+        with rasterio.open(output_path, "w", **profile) as dst:
+            resampling = Resampling.bilinear if np.issubdtype(np.dtype(dtype), np.floating) else Resampling.nearest
+            for band_index in range(1, count + 1):
+                src_band = sar_src.read(band_index)
+                destination = np.zeros((height, width), dtype=src_band.dtype)
+                reproject(
+                    source=src_band,
+                    destination=destination,
+                    src_transform=src_transform,
+                    src_crs=src_crs,
+                    dst_transform=dst_transform,
+                    dst_crs=dst_crs,
+                    resampling=resampling,
+                )
+                dst.write(destination, band_index)
+            if source_mask is not None:
+                aligned_mask = np.zeros((height, width), dtype=np.float32)
+                reproject(
+                    source=np.asarray(source_mask, dtype=np.float32),
+                    destination=aligned_mask,
+                    src_transform=src_transform,
+                    src_crs=src_crs,
+                    dst_transform=dst_transform,
+                    dst_crs=dst_crs,
+                    resampling=Resampling.nearest,
+                )
+                dst.write_mask(np.where(aligned_mask > 0, 255, 0).astype(np.uint8))
 
 
 class ImagePane(QFrame):
@@ -3359,6 +3516,7 @@ class MainWindow(QMainWindow):
             "annotations": [],
             "next_box_id": 1,
             "selected_box_id": None,
+            "aligned_sar_path": "",
             "sar_edit": {
                 "scale": 1.0,
                 "rotation": 0.0,
@@ -3382,6 +3540,7 @@ class MainWindow(QMainWindow):
             payload[tile_name] = {
                 "next_box_id": int(state.get("next_box_id", 1)),
                 "selected_box_id": state.get("selected_box_id"),
+                "aligned_sar_path": str(state.get("aligned_sar_path", "")),
                 "sar_edit": {
                     "scale": float(state.get("sar_edit", {}).get("scale", 1.0)),
                     "rotation": float(state.get("sar_edit", {}).get("rotation", 0.0)),
@@ -3407,6 +3566,7 @@ class MainWindow(QMainWindow):
                 "annotations": annotations,
                 "next_box_id": next_box_id,
                 "selected_box_id": state.get("selected_box_id"),
+                "aligned_sar_path": str(state.get("aligned_sar_path", "")),
                 "sar_edit": {
                     "scale": float(state.get("sar_edit", {}).get("scale", 1.0)),
                     "rotation": float(state.get("sar_edit", {}).get("rotation", 0.0)),
@@ -3635,11 +3795,15 @@ class MainWindow(QMainWindow):
         if self.current_index < 0 or self.current_index >= len(self.tile_refs):
             return None, None
         sar_path, optical_path = self.tile_refs[self.current_index]
-        record = load_tile_pair(str(sar_path), str(optical_path))
-        state = self.tile_states.setdefault(record["name"], self._default_tile_state())
+        tile_name = sar_path.stem
+        state = self.tile_states.setdefault(tile_name, self._default_tile_state())
+        sar_source_path = Path(state.get("aligned_sar_path", "")).expanduser()
+        if not sar_source_path.is_file():
+            sar_source_path = sar_path
+        record = load_tile_pair(str(sar_source_path), str(optical_path))
         if not state["annotations"]:
             tile = TileRecord(
-                name=record["name"],
+                name=tile_name,
                 sar_path=record["sar_path"],
                 optical_path=record["optical_path"],
                 sar_data=record["sar_data"],
@@ -3662,7 +3826,7 @@ class MainWindow(QMainWindow):
             )
             annotations = self._load_annotations_from_geojson(tile)
             if not annotations:
-                restored = self._restored_tile_states.get(record["name"], {})
+                restored = self._restored_tile_states.get(tile_name, {})
                 if isinstance(restored, dict):
                     annotations = [BoxAnnotation.from_dict(item) for item in restored.get("annotations", []) if isinstance(item, dict)]
                     if annotations:
@@ -3675,7 +3839,7 @@ class MainWindow(QMainWindow):
                     state["selected_box_id"] = annotations[0].box_id
         annotations = state["annotations"]
         tile = TileRecord(
-            name=record["name"],
+            name=tile_name,
             sar_path=record["sar_path"],
             optical_path=record["optical_path"],
             sar_data=record["sar_data"],
@@ -3972,6 +4136,17 @@ class MainWindow(QMainWindow):
         tile, state = self.current_tile_state()
         if tile is None:
             return
+        sar_edit = dict(state.get("sar_edit", {}))
+        if self._has_sar_edit_transform(sar_edit):
+            aligned_dir = Path(self.output_dir) / "AlignedSAR"
+            aligned_path = aligned_dir / f"{tile.name}.tif"
+            try:
+                save_aligned_sar_raster(tile.sar_path, tile.optical_path, aligned_path, sar_edit)
+                state["aligned_sar_path"] = str(aligned_path)
+                state["sar_edit"] = {"scale": 1.0, "rotation": 0.0, "offset_x": 0.0, "offset_y": 0.0}
+            except Exception as exc:
+                QMessageBox.warning(self, "SAR edit save failed", f"Could not save the aligned SAR raster.\n\n{exc}")
+                return
         self._save_project_state()
         if hasattr(self.annotate_page, "overlap_toggle"):
             self.annotate_page.overlap_toggle.blockSignals(True)
@@ -4005,20 +4180,6 @@ class MainWindow(QMainWindow):
                 })
             self.annotate_page.set_tiles(tile_rows, self.current_index)
         if self.phase == "annotate":
-            sar_image = render_preview_image(
-                str(tile.sar_path),
-                str(tile.optical_path),
-                "sar",
-                view_bounds["left"],
-                view_bounds["bottom"],
-                view_bounds["right"],
-                view_bounds["top"],
-                *preview_sizes["sar"],
-                self._sar_contrast_low,
-                self._sar_contrast_high,
-                "source",
-                transparent_nodata=compare_mode or has_sar_transform,
-            )
             opt_image = render_preview_image(
                 str(tile.sar_path),
                 str(tile.optical_path),
@@ -4029,7 +4190,40 @@ class MainWindow(QMainWindow):
                 view_bounds["top"],
                 *preview_sizes["optical"],
             )
-            sar_display_image = apply_display_transform(sar_image, sar_edit) if has_sar_transform else sar_image
+            sar_display_image = (
+                render_aligned_sar_preview(
+                    str(tile.sar_path),
+                    str(tile.optical_path),
+                    view_bounds["left"],
+                    view_bounds["bottom"],
+                    view_bounds["right"],
+                    view_bounds["top"],
+                    *preview_sizes["sar"],
+                    self._sar_contrast_low,
+                    self._sar_contrast_high,
+                    "source",
+                    True,
+                    float(sar_edit.get("scale", 1.0)),
+                    float(sar_edit.get("rotation", 0.0)),
+                    float(sar_edit.get("offset_x", 0.0)),
+                    float(sar_edit.get("offset_y", 0.0)),
+                )
+                if has_sar_transform
+                else render_preview_image(
+                    str(tile.sar_path),
+                    str(tile.optical_path),
+                    "sar",
+                    view_bounds["left"],
+                    view_bounds["bottom"],
+                    view_bounds["right"],
+                    view_bounds["top"],
+                    *preview_sizes["sar"],
+                    self._sar_contrast_low,
+                    self._sar_contrast_high,
+                    "source",
+                    transparent_nodata=compare_mode,
+                )
+            )
             if compare_mode:
                 overlay_image = sar_display_image if base_kind == "optical" else opt_image
                 base_image = opt_image if base_kind == "optical" else sar_display_image
@@ -4077,21 +4271,40 @@ class MainWindow(QMainWindow):
             self._sync_confidence_control(tile, state)
             self._sync_annotation_tool_state()
         elif self.phase == "metadata":
-            sar_image = render_preview_image(
-                str(tile.sar_path),
-                str(tile.optical_path),
-                "sar",
-                view_bounds["left"],
-                view_bounds["bottom"],
-                view_bounds["right"],
-                view_bounds["top"],
-                *preview_sizes["meta"],
-                self._sar_contrast_low,
-                self._sar_contrast_high,
-                "source",
-                transparent_nodata=has_sar_transform,
+            sar_display_image = (
+                render_aligned_sar_preview(
+                    str(tile.sar_path),
+                    str(tile.optical_path),
+                    view_bounds["left"],
+                    view_bounds["bottom"],
+                    view_bounds["right"],
+                    view_bounds["top"],
+                    *preview_sizes["meta"],
+                    self._sar_contrast_low,
+                    self._sar_contrast_high,
+                    "source",
+                    True,
+                    float(sar_edit.get("scale", 1.0)),
+                    float(sar_edit.get("rotation", 0.0)),
+                    float(sar_edit.get("offset_x", 0.0)),
+                    float(sar_edit.get("offset_y", 0.0)),
+                )
+                if has_sar_transform
+                else render_preview_image(
+                    str(tile.sar_path),
+                    str(tile.optical_path),
+                    "sar",
+                    view_bounds["left"],
+                    view_bounds["bottom"],
+                    view_bounds["right"],
+                    view_bounds["top"],
+                    *preview_sizes["meta"],
+                    self._sar_contrast_low,
+                    self._sar_contrast_high,
+                    "source",
+                    transparent_nodata=False,
+                )
             )
-            sar_display_image = apply_display_transform(sar_image, sar_edit) if has_sar_transform else sar_image
             self.metadata_page.sar_pane.set_content(
                 sar_display_image,
                 view_bounds,
