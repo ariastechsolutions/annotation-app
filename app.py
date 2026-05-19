@@ -54,7 +54,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.16"
+APP_VERSION = "1.0.17"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
@@ -2973,7 +2973,7 @@ class MainWindow(QMainWindow):
         self.annotate_page.fit_button.clicked.connect(self.fit_view)
         self.annotate_page.draw_button.clicked.connect(lambda: self.set_tool_mode("draw"))
         self.annotate_page.select_button.clicked.connect(lambda: self.set_tool_mode("select"))
-        self.annotate_page.previous_button.clicked.connect(self.go_previous_tile)
+        self.annotate_page.previous_button.clicked.connect(self._go_previous_tile)
         self.annotate_page.skip_button.clicked.connect(self.skip_current_tile)
         self.annotate_page.next_button.clicked.connect(self.enter_metadata_phase)
         self.annotate_page.edit_button.clicked.connect(self.edit_selected_box)

@@ -1,7 +1,7 @@
 {
-  "latest_version": "1.0.16",
-  "release_name": "ATS Annotation Tool 1.0.16",
-  "body": "Bootstrap release for previous-tile navigation, confidence labels, overlap transparency, and SAR alignment editing.",
+  "latest_version": "1.0.17",
+  "release_name": "ATS Annotation Tool 1.0.17",
+  "body": "Fix previous-tile navigation crash after the 1.0.16 release.",
   "release_url": "https://github.com/ariastechsolutions/annotation-app/releases/latest",
   "download_url": "",
   "asset_name": ""
