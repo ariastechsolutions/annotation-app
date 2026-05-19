@@ -48,13 +48,14 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStatusBar,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.17"
+APP_VERSION = "1.0.18"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
@@ -350,6 +351,21 @@ def apply_theme(app: QApplication, t: dict) -> None:
             background: rgba(239, 68, 68, 0.32);
             border-color: rgba(239, 68, 68, 0.72);
             color: #ffffff;
+        }}
+        QFrame#CollapsibleSection {{
+            background: {t["bg1"]};
+            border: 1px solid {t["border_strong"]};
+            border-radius: 8px;
+        }}
+        QToolButton#CollapseHeader {{
+            background: transparent;
+            border: 0;
+            color: {t["text_primary"]};
+            font-weight: 700;
+            text-align: left;
+            padding: 6px 4px;
+            font-family: "DM Mono", monospace;
+            letter-spacing: 0.04em;
         }}
         QLabel#UpdateLog {{
             background: transparent;
@@ -1133,6 +1149,31 @@ def composite_images_with_transform(
         painter.restore()
     else:
         painter.drawImage(0, 0, overlay_image)
+    painter.end()
+    return result
+
+
+def apply_display_transform(image: QImage | None, transform_state: dict | None) -> QImage | None:
+    if image is None or image.isNull():
+        return None
+    transform_state = transform_state or {}
+    scale = float(transform_state.get("scale", 1.0))
+    rotation = float(transform_state.get("rotation", 0.0))
+    offset_x = float(transform_state.get("offset_x", 0.0))
+    offset_y = float(transform_state.get("offset_y", 0.0))
+    if abs(scale - 1.0) < 1e-6 and abs(rotation) < 1e-6 and abs(offset_x) < 1e-6 and abs(offset_y) < 1e-6:
+        return image.copy()
+    result = QImage(image.size(), QImage.Format_ARGB32_Premultiplied)
+    result.fill(Qt.transparent)
+    painter = QPainter(result)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+    center_x = image.width() / 2.0 + offset_x * image.width()
+    center_y = image.height() / 2.0 + offset_y * image.height()
+    painter.translate(center_x, center_y)
+    painter.rotate(rotation)
+    painter.scale(scale, scale)
+    painter.translate(-image.width() / 2.0, -image.height() / 2.0)
+    painter.drawImage(0, 0, image)
     painter.end()
     return result
 
@@ -1945,6 +1986,44 @@ class MetadataRowWidget(QFrame):
         super().leaveEvent(event)
 
 
+class CollapsibleSection(QFrame):
+    def __init__(self, title: str, expanded: bool = True, parent=None):
+        super().__init__(parent)
+        self.setObjectName("CollapsibleSection")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+        self.header = QToolButton()
+        self.header.setObjectName("CollapseHeader")
+        self.header.setText(title)
+        self.header.setCheckable(True)
+        self.header.setChecked(expanded)
+        self.header.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.header.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.header.setCursor(Qt.PointingHandCursor)
+        self.header.toggled.connect(self._toggle_content)
+        self.content_widget = QWidget()
+        self.content_layout = QVBoxLayout(self.content_widget)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_layout.setSpacing(8)
+        layout.addWidget(self.header)
+        layout.addWidget(self.content_widget)
+        self.content_widget.setVisible(expanded)
+
+    def _toggle_content(self, checked: bool):
+        self.content_widget.setVisible(checked)
+        self.header.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+
+    def setExpanded(self, expanded: bool):
+        self.header.blockSignals(True)
+        self.header.setChecked(expanded)
+        self.header.blockSignals(False)
+        self._toggle_content(expanded)
+
+    def setVisible(self, visible: bool):
+        super().setVisible(visible)
+
+
 class RangeSlider(QWidget):
     valuesChanged = Signal(int, int)
 
@@ -2504,22 +2583,25 @@ class AnnotatePage(QWidget):
         contrast_layout.addWidget(contrast_hint)
         viewer_layout.addWidget(contrast_box)
 
-        side = QFrame()
-        side.setObjectName("InspectorPanel")
-        side_layout = QVBoxLayout(side)
-        side_layout.setContentsMargins(14, 14, 14, 14)
+        side_scroll = QScrollArea()
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        side_scroll.setFrameShape(QFrame.NoFrame)
+        side_content = QWidget()
+        side_scroll.setWidget(side_content)
+        side_layout = QVBoxLayout(side_content)
+        side_layout.setContentsMargins(0, 0, 0, 0)
         side_layout.setSpacing(10)
-        tile_title = QLabel("Tile browser")
-        tile_title.setObjectName("SectionTitle")
-        tile_hint = QLabel("Click a tile to jump to it. Processed tiles are marked and stay in the project state.")
-        tile_hint.setWordWrap(True)
-        tile_hint.setObjectName("PanelHint")
+
         self.tile_list = QListWidget()
         self.tile_list.setObjectName("TileBrowserList")
         self.tile_list.itemActivated.connect(self.tileActivated.emit)
-        side_layout.addWidget(tile_title)
-        side_layout.addWidget(tile_hint)
-        side_layout.addWidget(self.tile_list, 1)
+        tile_section = CollapsibleSection("Tile browser", expanded=True)
+        tile_section.content_layout.addWidget(QLabel("Click a tile to jump to it. Processed tiles are marked and stay in the project state."))
+        tile_section.content_layout.itemAt(0).widget().setWordWrap(True)
+        tile_section.content_layout.itemAt(0).widget().setObjectName("PanelHint")
+        tile_section.content_layout.addWidget(self.tile_list)
+
         self.overlap_toggle = QPushButton("Overlap view")
         self.overlap_toggle.setCheckable(True)
         self.overlap_toggle.setObjectName("ModeChipSelect")
@@ -2531,12 +2613,17 @@ class AnnotatePage(QWidget):
         self.opacity_slider.setValue(45)
         self.opacity_value = QLabel("45%")
         self.opacity_value.setObjectName("MutedText")
+        compare_section = CollapsibleSection("Overlap view", expanded=True)
+        compare_intro = QLabel("Choose which image acts as the base in overlap mode.")
+        compare_intro.setWordWrap(True)
+        compare_intro.setObjectName("PanelHint")
+        compare_section.content_layout.addWidget(compare_intro)
         compare_row = QHBoxLayout()
         compare_row.addWidget(QLabel("Base"))
         compare_row.addWidget(self.base_combo, 1)
+        compare_section.content_layout.addWidget(self.overlap_toggle)
+        compare_section.content_layout.addLayout(compare_row)
         self.opacity_caption = QLabel("SAR opacity")
-        side_layout.addWidget(self.overlap_toggle)
-        side_layout.addLayout(compare_row)
         self.opacity_widget = QWidget()
         opacity_layout = QHBoxLayout(self.opacity_widget)
         opacity_layout.setContentsMargins(0, 0, 0, 0)
@@ -2544,14 +2631,8 @@ class AnnotatePage(QWidget):
         opacity_layout.addWidget(self.opacity_slider, 1)
         opacity_layout.addWidget(self.opacity_value)
         self.opacity_widget.setVisible(False)
-        side_layout.addWidget(self.opacity_widget)
-        self.confidence_box = QFrame()
-        self.confidence_box.setObjectName("InspectorPanel")
-        confidence_layout = QVBoxLayout(self.confidence_box)
-        confidence_layout.setContentsMargins(10, 10, 10, 10)
-        confidence_layout.setSpacing(6)
-        confidence_title = QLabel("Confidence")
-        confidence_title.setObjectName("SectionTitle")
+        compare_section.content_layout.addWidget(self.opacity_widget)
+
         self.confidence_slider = QSlider(Qt.Horizontal)
         self.confidence_slider.setRange(0, 2)
         self.confidence_slider.setSingleStep(1)
@@ -2567,13 +2648,11 @@ class AnnotatePage(QWidget):
         confidence_marks.addWidget(QLabel("average"))
         confidence_marks.addStretch(1)
         confidence_marks.addWidget(QLabel("high"))
-        confidence_layout.addWidget(confidence_title)
-        confidence_layout.addWidget(self.confidence_slider)
-        confidence_layout.addWidget(self.confidence_value)
-        confidence_layout.addLayout(confidence_marks)
-        side_layout.addWidget(self.confidence_box)
-        side_title = QLabel("Inspector")
-        side_title.setObjectName("SectionTitle")
+        confidence_section = CollapsibleSection("Box confidence", expanded=True)
+        confidence_section.content_layout.addWidget(self.confidence_slider)
+        confidence_section.content_layout.addWidget(self.confidence_value)
+        confidence_section.content_layout.addLayout(confidence_marks)
+
         self.project_summary = QLabel("No project loaded")
         self.project_summary.setWordWrap(True)
         self.project_summary.setObjectName("PanelHint")
@@ -2588,6 +2667,16 @@ class AnnotatePage(QWidget):
         box_actions.addWidget(self.edit_button)
         box_actions.addWidget(self.delete_button)
         self.split_edit_toggle = QCheckBox("Split editing")
+        self.debug_note = QLabel("Box list updates live as you draw.")
+        self.debug_note.setWordWrap(True)
+        self.debug_note.setObjectName("PanelHint")
+        inspector_section = CollapsibleSection("Boxes", expanded=True)
+        inspector_section.content_layout.addWidget(self.project_summary)
+        inspector_section.content_layout.addWidget(self.box_list)
+        inspector_section.content_layout.addLayout(box_actions)
+        inspector_section.content_layout.addWidget(self.split_edit_toggle)
+        inspector_section.content_layout.addWidget(self.debug_note)
+
         self.sar_edit_toggle = QPushButton("SAR edit")
         self.sar_edit_toggle.setCheckable(True)
         self.sar_edit_toggle.setObjectName("DangerToggle")
@@ -2628,23 +2717,25 @@ class AnnotatePage(QWidget):
         sar_edit_layout.addWidget(self.sar_edit_save)
         self.sar_edit_toggle.setVisible(False)
         self.sar_edit_widget.setVisible(False)
-        self.debug_note = QLabel("Box list updates live as you draw.")
-        self.debug_note.setWordWrap(True)
-        self.debug_note.setObjectName("PanelHint")
-        side_layout.addWidget(tile_title)
-        side_layout.addWidget(tile_hint)
-        side_layout.addWidget(self.tile_list, 1)
-        side_layout.addWidget(side_title)
-        side_layout.addWidget(self.project_summary)
-        side_layout.addWidget(self.box_list, 1)
-        side_layout.addLayout(box_actions)
-        side_layout.addWidget(self.sar_edit_toggle)
-        side_layout.addWidget(self.sar_edit_widget)
-        side_layout.addWidget(self.split_edit_toggle)
-        side_layout.addWidget(self.debug_note)
+        sar_edit_section = CollapsibleSection("SAR edit", expanded=False)
+        sar_edit_section.content_layout.addWidget(self.sar_edit_toggle)
+        sar_edit_section.content_layout.addWidget(self.sar_edit_widget)
+
+        side_layout.addWidget(tile_section)
+        side_layout.addWidget(compare_section)
+        side_layout.addWidget(confidence_section)
+        side_layout.addWidget(inspector_section)
+        side_layout.addWidget(sar_edit_section)
+        side_layout.addStretch(1)
+        self.sidebar_scroll = side_scroll
+        self.tile_section = tile_section
+        self.compare_section = compare_section
+        self.confidence_section = confidence_section
+        self.inspector_section = inspector_section
+        self.sar_edit_section = sar_edit_section
 
         body.addWidget(viewer_frame)
-        body.addWidget(side)
+        body.addWidget(side_scroll)
         body.setStretchFactor(0, 4)
         body.setStretchFactor(1, 1)
 
@@ -3680,6 +3771,8 @@ class MainWindow(QMainWindow):
             self.annotate_page.sar_edit_toggle.setVisible(bool(checked))
         if hasattr(self.annotate_page, "sar_edit_widget"):
             self.annotate_page.sar_edit_widget.setVisible(bool(checked and self._sar_edit_mode))
+        if hasattr(self.annotate_page, "sar_edit_section"):
+            self.annotate_page.sar_edit_section.setVisible(bool(checked))
         if checked and hasattr(self.annotate_page, "base_combo"):
             self.annotate_page.base_combo.setEnabled(not self._sar_edit_mode)
         if not checked and hasattr(self.annotate_page, "base_combo"):
@@ -3764,6 +3857,13 @@ class MainWindow(QMainWindow):
             },
         )
 
+    def _has_sar_edit_transform(self, sar_edit: dict | None):
+        sar_edit = sar_edit or {}
+        return any(
+            abs(float(sar_edit.get(key, default)) - default) > 1e-6
+            for key, default in [("scale", 1.0), ("rotation", 0.0), ("offset_x", 0.0), ("offset_y", 0.0)]
+        )
+
     def _set_sar_edit_mode(self, enabled: bool):
         self._sar_edit_mode = bool(enabled)
         state = None
@@ -3791,10 +3891,14 @@ class MainWindow(QMainWindow):
                 widget.setEnabled(not self._sar_edit_mode)
         if hasattr(self.annotate_page, "sar_edit_widget"):
             self.annotate_page.sar_edit_widget.setVisible(self._sar_edit_mode)
+        if hasattr(self.annotate_page, "sar_edit_section"):
+            self.annotate_page.sar_edit_section.setVisible(bool(getattr(self.annotate_page, "overlap_toggle", None) and self.annotate_page.overlap_toggle.isChecked()))
         if self._sar_edit_mode and hasattr(self.annotate_page, "overlap_toggle") and not self.annotate_page.overlap_toggle.isChecked():
             self.annotate_page.overlap_toggle.blockSignals(True)
             self.annotate_page.overlap_toggle.setChecked(True)
             self.annotate_page.overlap_toggle.blockSignals(False)
+        if hasattr(self.annotate_page, "sar_edit_section"):
+            self.annotate_page.sar_edit_section.setVisible(bool(self._sar_edit_mode and hasattr(self.annotate_page, "overlap_toggle") and self.annotate_page.overlap_toggle.isChecked()))
         if self._sar_edit_mode and hasattr(self.annotate_page, "base_combo"):
             self.annotate_page.base_combo.blockSignals(True)
             try:
@@ -3889,6 +3993,8 @@ class MainWindow(QMainWindow):
         compare_mode = bool(getattr(self.annotate_page, "overlap_toggle", None) and self.annotate_page.overlap_toggle.isChecked())
         base_kind = self._comparison_base_kind()
         base_boxes = optical_boxes if base_kind == "optical" else sar_boxes
+        sar_edit = state.get("sar_edit", {})
+        has_sar_transform = self._has_sar_edit_transform(sar_edit)
         if hasattr(self.annotate_page, "set_tiles"):
             tile_rows = []
             for idx, (sar_path, _opt_path) in enumerate(self.tile_refs):
@@ -3911,7 +4017,7 @@ class MainWindow(QMainWindow):
                 self._sar_contrast_low,
                 self._sar_contrast_high,
                 "source",
-                transparent_nodata=compare_mode,
+                transparent_nodata=compare_mode or has_sar_transform,
             )
             opt_image = render_preview_image(
                 str(tile.sar_path),
@@ -3922,14 +4028,13 @@ class MainWindow(QMainWindow):
                 view_bounds["right"],
                 view_bounds["top"],
                 *preview_sizes["optical"],
-                transparent_nodata=compare_mode,
             )
+            sar_display_image = apply_display_transform(sar_image, sar_edit) if has_sar_transform else sar_image
             if compare_mode:
-                overlay_image = sar_image if base_kind == "optical" else opt_image
-                base_image = opt_image if base_kind == "optical" else sar_image
-                overlay_transform = state.get("sar_edit") if self._sar_edit_mode and base_kind == "optical" else None
+                overlay_image = sar_display_image if base_kind == "optical" else opt_image
+                base_image = opt_image if base_kind == "optical" else sar_display_image
                 opacity = self.annotate_page.opacity_slider.value() / 100.0 if hasattr(self.annotate_page, "opacity_slider") else 0.45
-                composite = composite_images_with_transform(base_image, overlay_image, opacity, overlay_transform)
+                composite = composite_images(base_image, overlay_image, opacity)
                 self.annotate_page.overlap_pane.image_kind = base_kind
                 self.annotate_page.overlap_pane.title = f"Overlap View ({base_kind.title()} base)"
                 self.annotate_page.overlap_pane.set_content(
@@ -3946,13 +4051,13 @@ class MainWindow(QMainWindow):
             else:
                 self.annotate_page.viewer_stack.setCurrentIndex(0)
             self.annotate_page.sar_pane.set_content(
-                sar_image,
+                sar_display_image,
                 view_bounds,
                 sar_boxes,
                 state["selected_box_id"],
                 self.tool_mode,
                 draw_debug_bounds(tile),
-                f"{preview_sizes['sar'][0]}x{preview_sizes['sar'][1]} | {'loaded' if not sar_image.isNull() else 'decode failed'}",
+                f"{preview_sizes['sar'][0]}x{preview_sizes['sar'][1]} | {'loaded' if sar_display_image is not None and not sar_display_image.isNull() else 'decode failed'}",
             )
             self.annotate_page.optical_pane.set_content(
                 opt_image,
@@ -3984,15 +4089,17 @@ class MainWindow(QMainWindow):
                 self._sar_contrast_low,
                 self._sar_contrast_high,
                 "source",
+                transparent_nodata=has_sar_transform,
             )
+            sar_display_image = apply_display_transform(sar_image, sar_edit) if has_sar_transform else sar_image
             self.metadata_page.sar_pane.set_content(
-                sar_image,
+                sar_display_image,
                 view_bounds,
                 sar_boxes,
                 state["selected_box_id"],
                 "select",
                 draw_debug_bounds(tile),
-                f"{preview_sizes['meta'][0]}x{preview_sizes['meta'][1]} | {'loaded' if not sar_image.isNull() else 'decode failed'}",
+                f"{preview_sizes['meta'][0]}x{preview_sizes['meta'][1]} | {'loaded' if sar_display_image is not None and not sar_display_image.isNull() else 'decode failed'}",
             )
             self.metadata_page.set_header(tile.name, self.current_index, len(self.tile_refs))
             self.metadata_page.set_boxes(sar_boxes, state["selected_box_id"])
