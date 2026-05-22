@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.22"
+APP_VERSION = "1.0.23"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
@@ -2167,6 +2167,13 @@ class ImagePane(QFrame):
         self._temp_rect = self._interaction
         self.setCursor(Qt.CrossCursor)
 
+    def _clear_polygon_draw(self):
+        self.polygonPreviewChanged.emit({"image_kind": self.image_kind, "active": False})
+        self._interaction = None
+        self._temp_rect = None
+        self.unsetCursor()
+        self.update()
+
     def _start_overlay_drag(self, event):
         self._interaction = {
             "kind": "overlay_drag",
@@ -2233,12 +2240,20 @@ class ImagePane(QFrame):
             if event.button() == Qt.RightButton and self._interaction and self._interaction.get("kind") == "draw_polygon":
                 points = list(self._interaction.get("points", []))
                 if len(points) >= 3:
+                    self._interaction["current_world"] = points[-1]
+                    self._temp_rect = self._interaction
+                    self.polygonPreviewChanged.emit(
+                        {
+                            "image_kind": self.image_kind,
+                            "points": points,
+                            "current_world": points[-1],
+                            "active": True,
+                        }
+                    )
                     self.boxDrawn.emit({"points": points, "image_kind": self.image_kind})
-                self.polygonPreviewChanged.emit({"image_kind": self.image_kind, "active": False})
-                self._interaction = None
-                self._temp_rect = None
-                self.unsetCursor()
-                self.update()
+                    QTimer.singleShot(0, self._clear_polygon_draw)
+                else:
+                    self._clear_polygon_draw()
                 return
         if self.mode == "overlay_edit" and event.button() == Qt.LeftButton:
             self._start_overlay_drag(event)
@@ -4628,13 +4643,16 @@ class MainWindow(QMainWindow):
             preview_points = _points_to_tuples(self._polygon_preview.get("points", []))
             if len(preview_points) >= 2:
                 projected_preview = project_optical_polygon_to_sar(tile, preview_points, self.full_sar_path, self.dem_path)
-                if projected_preview:
+                if not projected_preview:
+                    projected_preview = preview_points
+                bounds = _polygon_bounds(projected_preview)
+                if bounds:
                     preview_box = {
                         "box_id": -1,
-                        "xmin": _polygon_bounds(projected_preview)[0],
-                        "ymin": _polygon_bounds(projected_preview)[1],
-                        "xmax": _polygon_bounds(projected_preview)[2],
-                        "ymax": _polygon_bounds(projected_preview)[3],
+                        "xmin": bounds[0],
+                        "ymin": bounds[1],
+                        "xmax": bounds[2],
+                        "ymax": bounds[3],
                         "building_status": "preview",
                         "damage_level": "",
                         "confidence": "average",
@@ -4998,6 +5016,9 @@ class MainWindow(QMainWindow):
             optical_points = _points_to_tuples(box_data["points"])
             sar_points = project_optical_polygon_to_sar(tile, optical_points, self.full_sar_path, self.dem_path)
             sar_bounds = _polygon_bounds(sar_points)
+            if sar_bounds is None:
+                sar_points = list(optical_points)
+                sar_bounds = _polygon_bounds(sar_points)
             if sar_bounds is None:
                 return
             box = BoxAnnotation(
