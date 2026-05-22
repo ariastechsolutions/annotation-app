@@ -2174,6 +2174,24 @@ class ImagePane(QFrame):
         self.unsetCursor()
         self.update()
 
+    def _finish_polygon_draw(self, points):
+        if len(points) < 3:
+            self._clear_polygon_draw()
+            return
+        self._interaction["finished"] = True
+        self._interaction["current_world"] = points[-1]
+        self._temp_rect = self._interaction
+        self.polygonPreviewChanged.emit(
+            {
+                "image_kind": self.image_kind,
+                "points": points,
+                "current_world": points[-1],
+                "active": True,
+            }
+        )
+        self.boxDrawn.emit({"points": points, "image_kind": self.image_kind})
+        QTimer.singleShot(0, self._clear_polygon_draw)
+
     def _start_overlay_drag(self, event):
         self._interaction = {
             "kind": "overlay_drag",
@@ -2239,21 +2257,7 @@ class ImagePane(QFrame):
                 return
             if event.button() == Qt.RightButton and self._interaction and self._interaction.get("kind") == "draw_polygon":
                 points = list(self._interaction.get("points", []))
-                if len(points) >= 3:
-                    self._interaction["current_world"] = points[-1]
-                    self._temp_rect = self._interaction
-                    self.polygonPreviewChanged.emit(
-                        {
-                            "image_kind": self.image_kind,
-                            "points": points,
-                            "current_world": points[-1],
-                            "active": True,
-                        }
-                    )
-                    self.boxDrawn.emit({"points": points, "image_kind": self.image_kind})
-                    QTimer.singleShot(0, self._clear_polygon_draw)
-                else:
-                    self._clear_polygon_draw()
+                self._finish_polygon_draw(points)
                 return
         if self.mode == "overlay_edit" and event.button() == Qt.LeftButton:
             self._start_overlay_drag(event)
@@ -2382,7 +2386,12 @@ class ImagePane(QFrame):
                 self.boxDrawn.emit({"xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax, "image_kind": self.image_kind})
             self._temp_rect = None
         elif self._interaction["kind"] == "draw_polygon":
-            self.polygonPreviewChanged.emit({"image_kind": self.image_kind, "active": False})
+            if self._interaction.get("finished"):
+                self._interaction = None
+                self._temp_rect = None
+                self.unsetCursor()
+            else:
+                self.polygonPreviewChanged.emit({"image_kind": self.image_kind, "active": False})
             self.update()
             return
         elif self._interaction["kind"] == "edit":
