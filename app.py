@@ -20,9 +20,9 @@ from pyproj import Transformer
 from rasterio.features import rasterize
 from rasterio.transform import from_bounds
 from rasterio.warp import Resampling, reproject, transform_bounds
-from shapely.geometry import Polygon, mapping, shape
+from shapely.geometry import Point, Polygon, mapping, shape
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal, QObject, QThread, QProcess, QUrl
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QImage, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QImage, QPainter, QPalette, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.21"
+APP_VERSION = "1.0.22"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
@@ -117,6 +117,223 @@ RECENT_PROJECTS_PATH = Path.home() / ".sar_annotation_recent_projects.json"
 APP_ICON_PATH = resource_path("ats_bar_logo.png")
 APP_LOGO_PATH = resource_path("ats_logo.png")
 LOCAL_UPDATE_MANIFEST_PATH = runtime_root() / "update_manifest.local.json"
+USER_HEIGHT_OFFSET = 0
+DEFAULT_GEO_CRS = "EPSG:4326"
+
+
+def _points_to_tuples(points):
+    if not points:
+        return []
+    return [(float(x), float(y)) for x, y in points]
+
+
+def _polygon_bounds(points):
+    pts = _points_to_tuples(points)
+    if not pts:
+        return None
+    xs = [pt[0] for pt in pts]
+    ys = [pt[1] for pt in pts]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+class RPCModel:
+    def __init__(self, rpc_meta: dict):
+        self.line_num = np.array(rpc_meta["line_num_coeff"], dtype=np.float64)
+        self.line_den = np.array(rpc_meta["line_den_coeff"], dtype=np.float64)
+        self.samp_num = np.array(rpc_meta["samp_num_coeff"], dtype=np.float64)
+        self.samp_den = np.array(rpc_meta["samp_den_coeff"], dtype=np.float64)
+        self.lat_off = float(rpc_meta["lat_off"])
+        self.lat_scale = float(rpc_meta["lat_scale"])
+        self.lon_off = float(rpc_meta["long_off"])
+        self.lon_scale = float(rpc_meta["long_scale"])
+        self.h_off = float(rpc_meta["height_off"])
+        self.h_scale = float(rpc_meta["height_scale"])
+        self.line_off = float(rpc_meta["line_off"])
+        self.line_scale = float(rpc_meta["line_scale"])
+        self.samp_off = float(rpc_meta["samp_off"])
+        self.samp_scale = float(rpc_meta["samp_scale"])
+
+    def _eval_poly(self, coeffs, L, P, H):
+        L2 = L * L
+        L3 = L2 * L
+        P2 = P * P
+        P3 = P2 * P
+        H2 = H * H
+        H3 = H2 * H
+        return (
+            coeffs[0]
+            + coeffs[1] * L
+            + coeffs[2] * P
+            + coeffs[3] * H
+            + coeffs[4] * L * P
+            + coeffs[5] * L * H
+            + coeffs[6] * P * H
+            + coeffs[7] * L2
+            + coeffs[8] * P2
+            + coeffs[9] * H2
+            + coeffs[10] * P * L * H
+            + coeffs[11] * L3
+            + coeffs[12] * L * P2
+            + coeffs[13] * L * H2
+            + coeffs[14] * L2 * P
+            + coeffs[15] * P3
+            + coeffs[16] * P * H2
+            + coeffs[17] * L2 * H
+            + coeffs[18] * P2 * H
+            + coeffs[19] * H3
+        )
+
+    def forward(self, lons, lats, heights):
+        lons = np.asarray(lons, dtype=np.float64)
+        lats = np.asarray(lats, dtype=np.float64)
+        heights = np.asarray(heights, dtype=np.float64)
+        P = (lats - self.lat_off) / self.lat_scale
+        L = (lons - self.lon_off) / self.lon_scale
+        H = (heights - self.h_off) / self.h_scale
+        num_l = self._eval_poly(self.line_num, L, P, H)
+        den_l = self._eval_poly(self.line_den, L, P, H)
+        num_s = self._eval_poly(self.samp_num, L, P, H)
+        den_s = self._eval_poly(self.samp_den, L, P, H)
+        row_n = num_l / den_l
+        col_n = num_s / den_s
+        rows = row_n * self.line_scale + self.line_off
+        cols = col_n * self.samp_scale + self.samp_off
+        return rows, cols
+
+
+def parse_transform_meta(metadata: dict) -> dict:
+    parsed = {}
+    for key, value in metadata.items():
+        if value is None:
+            continue
+        try:
+            parsed[key] = int(value)
+            continue
+        except Exception:
+            pass
+        try:
+            parsed[key] = float(value)
+        except Exception:
+            parsed[key] = value
+    return parsed
+
+
+def transform_points_to_crop(points_global: np.ndarray, w_col_off, w_row_off, crop_x, crop_y, M, **kwargs) -> np.ndarray:
+    if points_global.ndim != 2 or points_global.shape[1] != 2:
+        raise ValueError("points_global must be an Nx2 array of pixel coordinates.")
+    w_col_off = int(w_col_off)
+    w_row_off = int(w_row_off)
+    crop_x = int(crop_x)
+    crop_y = int(crop_y)
+    if isinstance(M, str):
+        cleaned = re.sub(r"[\[\]]", "", M)
+        matrix_array = np.fromstring(cleaned, sep=" ", dtype=np.float64)
+    else:
+        matrix_array = np.asarray(M, dtype=np.float64)
+    if matrix_array.ndim == 1 and matrix_array.size == 6:
+        matrix = matrix_array.reshape(2, 3)
+    elif matrix_array.shape == (2, 3):
+        matrix = matrix_array
+    else:
+        raise ValueError("Affine matrix M must be a 2x3 array or a flat 6-element string.")
+    offset_array = np.array([w_col_off, w_row_off], dtype=np.float64)
+    local_pts = points_global.astype(np.float64) - offset_array
+    ones = np.ones((local_pts.shape[0], 1), dtype=np.float64)
+    pts_homog = np.hstack([local_pts, ones])
+    rotated_pts = (matrix @ pts_homog.T).T
+    return rotated_pts - np.array([crop_x, crop_y], dtype=np.float64)
+
+
+def _sample_dem_heights(dem_path: str, lons: list[float], lats: list[float]) -> np.ndarray:
+    try:
+        with rasterio.open(dem_path) as src:
+            if src.crs is None:
+                raise ValueError("DEM raster has no CRS.")
+            if src.crs.to_epsg() != 4326:
+                xs, ys = Transformer.from_crs(DEFAULT_GEO_CRS, src.crs, always_xy=True).transform(lons, lats)
+                coords_proj = list(zip(xs, ys))
+            else:
+                coords_proj = list(zip(lons, lats))
+            heights = [value[0] for value in src.sample(coords_proj)]
+            return np.array(heights, dtype=np.float64)
+    except Exception as exc:
+        logger.error("Failed to sample DEM '%s': %s", dem_path, exc)
+        return np.full(len(lons), np.nan, dtype=np.float64)
+
+
+def rpc_projection(sar_file: str, dem_file: str, lon_lat_points: np.ndarray):
+    if lon_lat_points.size == 0:
+        return np.empty((0,), dtype=np.float64), np.empty((0,), dtype=np.float64)
+    with rasterio.open(sar_file) as src:
+        if not src.rpcs:
+            raise ValueError("SAR image missing RPC metadata.")
+        if src.crs is None:
+            raise ValueError("SAR image CRS is unavailable.")
+        crs_a = src.crs.to_string()
+        rpc_model = RPCModel(src.rpcs.to_dict())
+    lon, lat = lon_lat_points.T
+    lons, lats = Transformer.from_crs(crs_a, DEFAULT_GEO_CRS, always_xy=True).transform(lon, lat)
+    heights = _sample_dem_heights(dem_file, lons.tolist(), lats.tolist())
+    heights = np.where(np.isnan(heights) | (heights == 0), rpc_model.h_off, heights + USER_HEIGHT_OFFSET)
+    rows, cols = rpc_model.forward(lons, lats, heights)
+    return rows, cols
+
+
+def live_coordinates_computation(points: np.ndarray, rpc_projector, tile_transformations):
+    tile_geo_transform, transform_meta = tile_transformations
+    rows, cols = rpc_projector(points)
+    points_global = np.column_stack((cols, rows)).astype(np.float64)
+    tile_frame_coords = transform_points_to_crop(points_global, **transform_meta)
+    tile_frame_x, tile_frame_y = tile_geo_transform * (tile_frame_coords[:, 0], tile_frame_coords[:, 1])
+    return np.column_stack((tile_frame_x, tile_frame_y))
+
+
+def initialize_transformations(sar_file: str, dem_file: str, sar_tile: str):
+    rpc_projector = lambda pts: rpc_projection(sar_file, dem_file, pts)
+    with rasterio.open(sar_tile) as src:
+        tile_geo_transform = src.transform
+        transform_meta = parse_transform_meta(src.tags())
+    return rpc_projector, (tile_geo_transform, transform_meta)
+
+
+def project_optical_polygon_to_sar(tile: TileRecord, optical_points, full_sar_path: str, dem_path: str):
+    points = np.asarray(_points_to_tuples(optical_points), dtype=np.float64)
+    if points.size == 0:
+        return []
+    try:
+        if full_sar_path:
+            with rasterio.open(full_sar_path) as full_sar_src:
+                full_sar_crs = full_sar_src.crs
+            if tile.optical_crs and full_sar_crs and tile.optical_crs != full_sar_crs:
+                transformer = Transformer.from_crs(tile.optical_crs, full_sar_crs, always_xy=True)
+                xs, ys = transformer.transform(points[:, 0], points[:, 1])
+                points = np.column_stack((xs, ys))
+        if not full_sar_path or not dem_path:
+            return [(float(x), float(y)) for x, y in points]
+        rpc_projector, tile_transformations = initialize_transformations(full_sar_path, dem_path, str(tile.sar_path))
+        projected = live_coordinates_computation(points, rpc_projector, tile_transformations)
+        return [(float(x), float(y)) for x, y in projected]
+    except Exception as exc:
+        logger.error("Failed to project optical polygon to SAR: %s", exc)
+        return [(float(x), float(y)) for x, y in points]
+
+
+def transform_points_between_bboxes(points, start_bbox, end_bbox):
+    pts = _points_to_tuples(points)
+    if not pts:
+        return []
+    sx0, sy0, sx1, sy1 = start_bbox
+    ex0, ey0, ex1, ey1 = end_bbox
+    sw = max(1e-9, float(sx1) - float(sx0))
+    sh = max(1e-9, float(sy1) - float(sy0))
+    ew = float(ex1) - float(ex0)
+    eh = float(ey1) - float(ey0)
+    out = []
+    for x, y in pts:
+        nx = (float(x) - float(sx0)) / sw
+        ny = (float(y) - float(sy0)) / sh
+        out.append((float(ex0) + nx * ew, float(ey0) + ny * eh))
+    return out
 
 
 def apply_theme(app: QApplication, t: dict) -> None:
@@ -702,12 +919,30 @@ class BoxAnnotation:
     damage_level: str = ""
     confidence: str = "average"
     split_editing: bool = False
+    points: list[tuple[float, float]] | None = None
     optical_xmin: float | None = None
     optical_ymin: float | None = None
     optical_xmax: float | None = None
     optical_ymax: float | None = None
+    optical_points: list[tuple[float, float]] | None = None
+
+    def has_polygon(self, image_kind: str = "sar") -> bool:
+        return bool(self.geometry_points(image_kind))
+
+    def geometry_points(self, image_kind: str = "sar"):
+        if image_kind == "optical" and self.split_editing and self.optical_points:
+            return _points_to_tuples(self.optical_points)
+        if self.points:
+            return _points_to_tuples(self.points)
+        xmin, ymin, xmax, ymax = self.geometry_for(image_kind)
+        return [(xmin, ymax), (xmax, ymax), (xmax, ymin), (xmin, ymin)]
 
     def normalized(self, image_kind: str = "sar"):
+        points = self.geometry_points(image_kind)
+        if points:
+            xs = [pt[0] for pt in points]
+            ys = [pt[1] for pt in points]
+            return min(xs), min(ys), max(xs), max(ys)
         xmin, ymin, xmax, ymax = self.geometry_for(image_kind)
         xmin, xmax = sorted([xmin, xmax])
         ymin, ymax = sorted([ymin, ymax])
@@ -723,6 +958,9 @@ class BoxAnnotation:
     def set_geometry(self, image_kind: str, xmin: float, ymin: float, xmax: float, ymax: float):
         xmin, xmax = sorted([xmin, xmax])
         ymin, ymax = sorted([ymin, ymax])
+        self.points = None
+        if image_kind == "optical" and self.split_editing and self.optical_points:
+            self.optical_points = None
         if image_kind == "optical" and self.split_editing:
             self.optical_xmin = xmin
             self.optical_ymin = ymin
@@ -746,13 +984,41 @@ class BoxAnnotation:
             self.optical_ymin = self.ymin
             self.optical_xmax = self.xmax
             self.optical_ymax = self.ymax
+        if self.points and not self.optical_points:
+            self.optical_points = list(self.points)
+        if self.optical_points and not self.points:
+            self.points = list(self.optical_points)
 
     def disable_split_editing(self):
         self.split_editing = False
 
     def polygon(self, image_kind: str = "sar"):
+        points = self.geometry_points(image_kind)
+        if len(points) >= 3:
+            if points[0] != points[-1]:
+                points = points + [points[0]]
+            return Polygon(points)
         xmin, ymin, xmax, ymax = self.normalized(image_kind)
         return Polygon([(xmin, ymax), (xmax, ymax), (xmax, ymin), (xmin, ymin), (xmin, ymax)])
+
+    def set_polygon(self, image_kind: str, points: list[tuple[float, float]], project_optical: bool = False):
+        pts = _points_to_tuples(points)
+        if len(pts) < 3:
+            raise ValueError("A polygon needs at least three points.")
+        bounds = _polygon_bounds(pts)
+        if bounds is None:
+            raise ValueError("Invalid polygon geometry.")
+        xmin, ymin, xmax, ymax = bounds
+        self.points = list(pts)
+        self.xmin, self.ymin, self.xmax, self.ymax = xmin, ymin, xmax, ymax
+        if image_kind == "optical":
+            self.optical_points = list(pts)
+            self.optical_xmin, self.optical_ymin, self.optical_xmax, self.optical_ymax = xmin, ymin, xmax, ymax
+            if project_optical:
+                self.split_editing = True
+        elif self.split_editing:
+            self.optical_points = list(pts)
+            self.optical_xmin, self.optical_ymin, self.optical_xmax, self.optical_ymax = xmin, ymin, xmax, ymax
 
     def to_dict(self):
         return {
@@ -765,10 +1031,12 @@ class BoxAnnotation:
             "damage_level": self.damage_level,
             "confidence": self.confidence,
             "split_editing": self.split_editing,
+            "points": self.points,
             "optical_xmin": self.optical_xmin,
             "optical_ymin": self.optical_ymin,
             "optical_xmax": self.optical_xmax,
             "optical_ymax": self.optical_ymax,
+            "optical_points": self.optical_points,
         }
 
     @classmethod
@@ -786,10 +1054,12 @@ class BoxAnnotation:
             damage_level=str(payload.get("damage_level", "")),
             confidence=str(payload.get("confidence", "average")),
             split_editing=bool(payload.get("split_editing", False)),
+            points=[tuple(point) for point in payload.get("points", [])] if isinstance(payload.get("points"), list) else None,
             optical_xmin=opt_value("optical_xmin"),
             optical_ymin=opt_value("optical_ymin"),
             optical_xmax=opt_value("optical_xmax"),
             optical_ymax=opt_value("optical_ymax"),
+            optical_points=[tuple(point) for point in payload.get("optical_points", [])] if isinstance(payload.get("optical_points"), list) else None,
         )
 
 
@@ -1289,6 +1559,9 @@ def box_to_dict(box: BoxAnnotation, image_kind: str = "sar"):
         "damage_level": box.damage_level,
         "confidence": box.confidence,
         "split_editing": box.split_editing,
+        "points": list(box.geometry_points(image_kind)),
+        "geometry_type": "polygon" if box.points else "rectangle",
+        "optical_points": list(box.optical_points or []),
         "image_kind": image_kind,
     }
 
@@ -1353,6 +1626,27 @@ def bbox_from_geometry(geometry, transformer=None):
     xs = [float(x) for x, _y in coords]
     ys = [float(y) for _x, y in coords]
     return min(xs), min(ys), max(xs), max(ys)
+
+
+def points_from_geometry(geometry, transformer=None):
+    if not geometry:
+        return []
+    try:
+        geom = shape(geometry)
+    except Exception:
+        return []
+    coords = []
+    try:
+        coords = list(geom.exterior.coords)
+    except Exception:
+        coords = []
+    if not coords:
+        return []
+    if coords[0] == coords[-1]:
+        coords = coords[:-1]
+    if transformer is not None:
+        coords = [transformer.transform(x, y) for x, y in coords]
+    return [(float(x), float(y)) for x, y in coords]
 
 
 def bbox_from_dict(payload):
@@ -1547,6 +1841,8 @@ def export_tile(tile: TileRecord, output_dir: Path, project_meta: dict):
                         "damage_level": box.damage_level,
                         "confidence": box.confidence,
                         "split_editing": box.split_editing,
+                        "sar_points": [list(point) for point in box.points] if box.points else [],
+                        "optical_points": [list(point) for point in box.optical_points] if box.optical_points else [],
                         "sar_geometry": {
                             "xmin": box.xmin,
                             "ymin": box.ymin,
@@ -1643,6 +1939,7 @@ class ImagePane(QFrame):
     boxEdited = Signal(dict)
     boxSelected = Signal(int)
     overlayTransformChanged = Signal(dict)
+    polygonPreviewChanged = Signal(dict)
     viewportResized = Signal()
 
     def __init__(self, title: str, image_kind: str = "sar", parent=None):
@@ -1780,12 +2077,20 @@ class ImagePane(QFrame):
 
     def _hit_test(self, world_pt):
         for box in reversed(self.boxes):
-            left = min(box["xmin"], box["xmax"])
-            right = max(box["xmin"], box["xmax"])
-            top = max(box["ymin"], box["ymax"])
-            bottom = min(box["ymin"], box["ymax"])
-            if left <= world_pt[0] <= right and bottom <= world_pt[1] <= top:
-                return box["box_id"]
+            if box.get("points"):
+                try:
+                    poly = Polygon(_points_to_tuples(box["points"]))
+                    if poly.is_valid and poly.covers(Point(world_pt[0], world_pt[1])):
+                        return box["box_id"]
+                except Exception:
+                    pass
+            else:
+                left = min(box["xmin"], box["xmax"])
+                right = max(box["xmin"], box["xmax"])
+                top = max(box["ymin"], box["ymax"])
+                bottom = min(box["ymin"], box["ymax"])
+                if left <= world_pt[0] <= right and bottom <= world_pt[1] <= top:
+                    return box["box_id"]
         return None
 
     def _selected_box(self):
@@ -1797,6 +2102,10 @@ class ImagePane(QFrame):
         left_top = self._world_to_canvas((min(box["xmin"], box["xmax"]), max(box["ymin"], box["ymax"])))
         right_bottom = self._world_to_canvas((max(box["xmin"], box["xmax"]), min(box["ymin"], box["ymax"])))
         return QRectF(left_top[0], left_top[1], right_bottom[0] - left_top[0], right_bottom[1] - left_top[1])
+
+    def _box_points_canvas(self, box, points_key: str = "points"):
+        points = box.get(points_key) or []
+        return [QPointF(*self._world_to_canvas(pt)) for pt in _points_to_tuples(points)]
 
     def _hit_handle(self, rect: QRectF, pos):
         handle_radius = 10
@@ -1811,8 +2120,8 @@ class ImagePane(QFrame):
                 return name
         return None
 
-    def _make_box_update(self, box_id: int, xmin: float, ymin: float, xmax: float, ymax: float):
-        return {
+    def _make_box_update(self, box_id: int, xmin: float, ymin: float, xmax: float, ymax: float, start_box: dict | None = None):
+        payload = {
             "box_id": box_id,
             "xmin": xmin,
             "ymin": ymin,
@@ -1820,6 +2129,14 @@ class ImagePane(QFrame):
             "ymax": ymax,
             "image_kind": self.image_kind,
         }
+        if start_box:
+            payload["start_xmin"] = start_box.get("xmin", xmin)
+            payload["start_ymin"] = start_box.get("ymin", ymin)
+            payload["start_xmax"] = start_box.get("xmax", xmax)
+            payload["start_ymax"] = start_box.get("ymax", ymax)
+            payload["start_points"] = list(start_box.get("points", []))
+            payload["start_optical_points"] = list(start_box.get("optical_points", []))
+        return payload
 
     def _start_pan(self, event):
         self._interaction = {
@@ -1838,6 +2155,16 @@ class ImagePane(QFrame):
             "current_world": start_world,
         }
         self._temp_rect = None
+        self.setCursor(Qt.CrossCursor)
+
+    def _start_polygon_draw(self, event):
+        start_world = self._canvas_to_world((event.position().x(), event.position().y()))
+        self._interaction = {
+            "kind": "draw_polygon",
+            "points": [start_world],
+            "current_world": start_world,
+        }
+        self._temp_rect = self._interaction
         self.setCursor(Qt.CrossCursor)
 
     def _start_overlay_drag(self, event):
@@ -1880,10 +2207,39 @@ class ImagePane(QFrame):
         self.viewChanged.emit(new_view)
 
     def mousePressEvent(self, event):
-        if not self.view_bounds or event.button() not in (Qt.LeftButton, Qt.MiddleButton):
+        if not self.view_bounds or event.button() not in (Qt.LeftButton, Qt.MiddleButton, Qt.RightButton):
             return
         if not self._display_rect.contains(event.position()):
             return
+        if self.mode == "draw" and self.image_kind == "optical":
+            if event.button() == Qt.LeftButton:
+                if self._interaction is None or self._interaction.get("kind") != "draw_polygon":
+                    self._start_polygon_draw(event)
+                else:
+                    point = self._canvas_to_world((event.position().x(), event.position().y()))
+                    self._interaction["points"].append(point)
+                    self._interaction["current_world"] = point
+                    self._temp_rect = self._interaction
+                self.polygonPreviewChanged.emit(
+                    {
+                        "image_kind": self.image_kind,
+                        "points": list(self._interaction.get("points", [])) if self._interaction else [],
+                        "current_world": self._interaction.get("current_world") if self._interaction else None,
+                        "active": True,
+                    }
+                )
+                self.update()
+                return
+            if event.button() == Qt.RightButton and self._interaction and self._interaction.get("kind") == "draw_polygon":
+                points = list(self._interaction.get("points", []))
+                if len(points) >= 3:
+                    self.boxDrawn.emit({"points": points, "image_kind": self.image_kind})
+                self.polygonPreviewChanged.emit({"image_kind": self.image_kind, "active": False})
+                self._interaction = None
+                self._temp_rect = None
+                self.unsetCursor()
+                self.update()
+                return
         if self.mode == "overlay_edit" and event.button() == Qt.LeftButton:
             self._start_overlay_drag(event)
             return
@@ -1943,6 +2299,18 @@ class ImagePane(QFrame):
             self._interaction["current_world"] = self._canvas_to_world((event.position().x(), event.position().y()))
             self._temp_rect = self._interaction
             self.update()
+        elif self._interaction["kind"] == "draw_polygon":
+            self._interaction["current_world"] = self._canvas_to_world((event.position().x(), event.position().y()))
+            self._temp_rect = self._interaction
+            self.polygonPreviewChanged.emit(
+                {
+                    "image_kind": self.image_kind,
+                    "points": list(self._interaction.get("points", [])),
+                    "current_world": self._interaction.get("current_world"),
+                    "active": True,
+                }
+            )
+            self.update()
         elif self._interaction["kind"] == "edit":
             start_box = self._interaction["start_box"]
             start_pos = self._interaction["start_pos"]
@@ -1954,6 +2322,7 @@ class ImagePane(QFrame):
             delta_y = dy * scale_y
             xmin, ymin, xmax, ymax = start_box["xmin"], start_box["ymin"], start_box["xmax"], start_box["ymax"]
             handle = self._interaction.get("handle")
+            start_bbox = (start_box["xmin"], start_box["ymin"], start_box["xmax"], start_box["ymax"])
             if handle == "nw":
                 xmin += delta_x
                 ymax -= delta_y
@@ -1971,7 +2340,16 @@ class ImagePane(QFrame):
                 xmax += delta_x
                 ymin -= delta_y
                 ymax -= delta_y
-            self._interaction["current_box"] = self._make_box_update(start_box["box_id"], xmin, ymin, xmax, ymax)
+            current_box = self._make_box_update(start_box["box_id"], xmin, ymin, xmax, ymax, start_box)
+            if start_box.get("points"):
+                end_bbox = (xmin, ymin, xmax, ymax)
+                if start_box.get("optical_points") and self.image_kind == "optical":
+                    optical_points = transform_points_between_bboxes(start_box.get("optical_points", []), start_bbox, end_bbox)
+                    current_box["optical_points"] = optical_points
+                    current_box["points"] = transform_points_between_bboxes(start_box.get("points", []), start_bbox, end_bbox)
+                else:
+                    current_box["points"] = transform_points_between_bboxes(start_box.get("points", []), start_bbox, end_bbox)
+            self._interaction["current_box"] = current_box
             self._temp_rect = self._interaction
             self.update()
 
@@ -1988,6 +2366,10 @@ class ImagePane(QFrame):
             if xmax - xmin > 0 and ymax - ymin > 0:
                 self.boxDrawn.emit({"xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax, "image_kind": self.image_kind})
             self._temp_rect = None
+        elif self._interaction["kind"] == "draw_polygon":
+            self.polygonPreviewChanged.emit({"image_kind": self.image_kind, "active": False})
+            self.update()
+            return
         elif self._interaction["kind"] == "edit":
             current = self._interaction.get("current_box", self._interaction["start_box"])
             xmin, ymin, xmax, ymax = current["xmin"], current["ymin"], current["xmax"], current["ymax"]
@@ -2060,16 +2442,26 @@ class OverlayWidget(QWidget):
                 painter.drawText(rect.adjusted(6, -18, 0, 0), Qt.AlignLeft | Qt.AlignTop, dbg.get("label", ""))
 
             for box in pane.boxes:
-                left_top = pane._world_to_canvas((min(box["xmin"], box["xmax"]), max(box["ymin"], box["ymax"])))
-                right_bottom = pane._world_to_canvas((max(box["xmin"], box["xmax"]), min(box["ymin"], box["ymax"])))
-                rect = QRectF(left_top[0], left_top[1], right_bottom[0] - left_top[0], right_bottom[1] - left_top[1])
                 selected = box["box_id"] == pane.selected_box_id
                 style = box_style(box)
                 stroke = "#e2e8f0" if selected else style["stroke"]
                 fill = QColor(226, 232, 240, 22) if selected else QColor(*style["fill"])
                 painter.setPen(QPen(QColor(stroke), 3 if selected else 2))
                 painter.setBrush(fill)
-                painter.drawRect(rect)
+                if box.get("points"):
+                    poly_points = [QPointF(*pane._world_to_canvas(pt)) for pt in _points_to_tuples(box["points"])]
+                    if poly_points:
+                        painter.drawPolygon(QPolygonF(poly_points))
+                        xs = [pt.x() for pt in poly_points]
+                        ys = [pt.y() for pt in poly_points]
+                        rect = QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+                    else:
+                        rect = QRectF()
+                else:
+                    left_top = pane._world_to_canvas((min(box["xmin"], box["xmax"]), max(box["ymin"], box["ymax"])))
+                    right_bottom = pane._world_to_canvas((max(box["xmin"], box["xmax"]), min(box["ymin"], box["ymax"])))
+                    rect = QRectF(left_top[0], left_top[1], right_bottom[0] - left_top[0], right_bottom[1] - left_top[1])
+                    painter.drawRect(rect)
                 painter.setPen(QColor("#e2e8f0" if selected else style["text"]))
                 painter.drawText(rect.adjusted(6, 6, 0, 0), Qt.AlignLeft | Qt.AlignTop, f"Box {box['box_id']}")
                 if selected and pane.mode == "edit":
@@ -2091,6 +2483,19 @@ class OverlayWidget(QWidget):
                 painter.setPen(QPen(QColor("#34d399"), 2, Qt.DashLine))
                 painter.setBrush(QColor(52, 211, 153, 22))
                 painter.drawRect(rect)
+            if pane._temp_rect and pane._temp_rect.get("kind") == "draw_polygon":
+                points = list(pane._temp_rect.get("points", []))
+                current = pane._temp_rect.get("current_world")
+                preview_points = points + ([current] if current is not None else [])
+                if len(preview_points) >= 2:
+                    canvas_points = [QPointF(*pane._world_to_canvas(pt)) for pt in preview_points]
+                    painter.setPen(QPen(QColor("#fb7185"), 2, Qt.DashLine))
+                    painter.setBrush(QColor(251, 113, 133, 20))
+                    painter.drawPolyline(QPolygonF(canvas_points))
+                    if len(points) >= 3:
+                        painter.drawPolygon(QPolygonF(canvas_points))
+                    for point in canvas_points:
+                        painter.drawEllipse(QRectF(point.x() - 3, point.y() - 3, 6, 6))
             if pane._temp_rect and pane._temp_rect.get("kind") == "edit":
                 current = pane._temp_rect.get("current_box", pane._temp_rect["start_box"])
                 rect = pane._box_rect_canvas(current)
@@ -2299,10 +2704,12 @@ class SetupPage(QWidget):
 
         self.sar_dir = QLineEdit("")
         self.optical_dir = QLineEdit("")
+        self.full_sar_path = QLineEdit("")
+        self.dem_path = QLineEdit("")
         self.output_dir = QLineEdit("")
         self.disaster_type = QLineEdit()
         self.project_meta_rows = []
-        for widget in [self.sar_dir, self.optical_dir, self.output_dir, self.disaster_type]:
+        for widget in [self.sar_dir, self.optical_dir, self.full_sar_path, self.dem_path, self.output_dir, self.disaster_type]:
             widget.textChanged.connect(lambda _=None: self.metadataChanged.emit())
 
         hero = QFrame()
@@ -2340,6 +2747,8 @@ class SetupPage(QWidget):
             ("Project root / output directory", self.output_dir, True),
             ("SAR tiles directory", self.sar_dir, True),
             ("Optical tiles directory", self.optical_dir, True),
+            ("Full SAR reference path", self.full_sar_path, True),
+            ("DEM path", self.dem_path, True),
         ]):
             label = QLabel(label_text)
             label.setObjectName("MutedText")
@@ -2350,6 +2759,8 @@ class SetupPage(QWidget):
                 btn.setObjectName("BrowseBtn")
                 if widget is self.output_dir:
                     btn.clicked.connect(lambda _=False: self._browse_project_root())
+                elif widget in (self.full_sar_path, self.dem_path):
+                    btn.clicked.connect(lambda _=False, line=widget: self._browse_file(line))
                 else:
                     btn.clicked.connect(lambda _=False, line=widget: self._browse(line))
                 path_form.addWidget(btn, row, 2)
@@ -2479,6 +2890,11 @@ class SetupPage(QWidget):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder", line_edit.text() or str(DEFAULT_ROOT))
         if folder:
             line_edit.setText(folder)
+
+    def _browse_file(self, line_edit: QLineEdit):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select File", line_edit.text() or str(Path.cwd()), "All Files (*.*)")
+        if file_path:
+            line_edit.setText(file_path)
 
     def _browse_project_root(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Project Root", self.output_dir.text() or str(Path.cwd()))
@@ -2619,6 +3035,8 @@ class SetupPage(QWidget):
             {
                 "sar_dir": self.sar_dir.text().strip(),
                 "optical_dir": self.optical_dir.text().strip(),
+                "full_sar_path": self.full_sar_path.text().strip(),
+                "dem_path": self.dem_path.text().strip(),
                 "output_dir": self.output_dir.text().strip(),
                 "disaster_type": self.disaster_type.text().strip(),
                 "project_metadata": self.project_metadata(),
@@ -2929,9 +3347,10 @@ class AnnotatePage(QWidget):
         self.box_list.clear()
         for box in boxes:
             split_tag = "split" if box.get("split_editing") else "shared"
+            geom_tag = "polygon" if box.get("geometry_type") == "polygon" else "box"
             confidence = box.get("confidence", "average")
             damage_part = f", {box['damage_level']}" if box.get("building_status") == "damaged" and box.get("damage_level") else ""
-            item = QListWidgetItem(f"Box {box['box_id']}  [{box['building_status']}{damage_part}, {confidence}, {split_tag}]")
+            item = QListWidgetItem(f"Box {box['box_id']}  [{geom_tag}, {box['building_status']}{damage_part}, {confidence}, {split_tag}]")
             item.setData(Qt.UserRole, box["box_id"])
             self.box_list.addItem(item)
             if box["box_id"] == selected_box_id:
@@ -3068,9 +3487,10 @@ class MetadataPage(QWidget):
             label = f"Box {box['box_id']}"
             self.box_select.addItem(label, box["box_id"])
             split_tag = "split" if box.get("split_editing") else "shared"
+            geom_tag = "polygon" if box.get("geometry_type") == "polygon" else "box"
             damage_part = f", {box['damage_level']}" if box["building_status"] == "damaged" and box["damage_level"] else ""
             confidence = box.get("confidence", "average")
-            item = QListWidgetItem(f"{label}  [{box['building_status']}{damage_part}, {confidence}, {split_tag}]")
+            item = QListWidgetItem(f"{label}  [{geom_tag}, {box['building_status']}{damage_part}, {confidence}, {split_tag}]")
             item.setData(Qt.UserRole, box["box_id"])
             self.box_list.addItem(item)
             if box["box_id"] == selected_box_id:
@@ -3101,6 +3521,8 @@ class MainWindow(QMainWindow):
         self.project_root = ""
         self.sar_dir = ""
         self.optical_dir = ""
+        self.full_sar_path = ""
+        self.dem_path = ""
         self.output_dir = ""
         self.disaster_type = ""
         self.project_metadata = {}
@@ -3133,6 +3555,7 @@ class MainWindow(QMainWindow):
         self._sar_contrast_low = 2
         self._sar_contrast_high = 98
         self._sar_edit_mode = False
+        self._polygon_preview = None
         self._update_check_started = False
         self._update_thread = None
         self._update_worker = None
@@ -3259,6 +3682,7 @@ class MainWindow(QMainWindow):
             pane.boxEdited.connect(self.on_box_edited)
             pane.boxSelected.connect(self.on_box_selected)
             pane.viewportResized.connect(self.schedule_refresh)
+            pane.polygonPreviewChanged.connect(self._polygon_preview_changed)
             if pane is self.annotate_page.overlap_pane:
                 pane.overlayTransformChanged.connect(self._overlay_transform_changed)
             pane.set_theme(DARK_TOKENS)
@@ -3276,6 +3700,8 @@ class MainWindow(QMainWindow):
         try:
             self.setup_page.sar_dir.setText(self.sar_dir)
             self.setup_page.optical_dir.setText(self.optical_dir)
+            self.setup_page.full_sar_path.setText(self.full_sar_path)
+            self.setup_page.dem_path.setText(self.dem_path)
             self.setup_page.output_dir.setText(self.output_dir)
             self.setup_page.disaster_type.setText(self.disaster_type)
             self.setup_page.set_metadata_rows(self.project_metadata_rows)
@@ -3288,6 +3714,18 @@ class MainWindow(QMainWindow):
     def _set_update_log(self, text: str):
         if hasattr(self, "update_log") and self.update_log is not None:
             self.update_log.setText(text)
+
+    def _polygon_preview_changed(self, payload: dict):
+        if not isinstance(payload, dict) or payload.get("image_kind") != "optical":
+            return
+        if not payload.get("active"):
+            self._polygon_preview = None
+        else:
+            self._polygon_preview = {
+                "points": payload.get("points", []),
+                "current_world": payload.get("current_world"),
+            }
+        self.schedule_refresh()
 
     def check_for_updates(self, show_dialog: bool = False):
         if self._update_check_started:
@@ -3494,6 +3932,8 @@ class MainWindow(QMainWindow):
             "project_root": self.output_dir,
             "sar_dir": self.sar_dir,
             "optical_dir": self.optical_dir,
+            "full_sar_path": self.full_sar_path,
+            "dem_path": self.dem_path,
             "output_dir": self.output_dir,
             "disaster_type": self.disaster_type,
             "project_metadata_rows": self.project_metadata_rows,
@@ -3618,21 +4058,30 @@ class MainWindow(QMainWindow):
                     "split_editing": bool(props.get("split_editing", False)),
                     "sar": None,
                     "optical": None,
+                    "sar_points": None,
+                    "optical_points": None,
                 },
             )
             source = str(props.get("source", "both"))
             geometry_bbox = bbox_from_geometry(feature.get("geometry"), transformer)
+            geometry_points = points_from_geometry(feature.get("geometry"), transformer)
             if source == "SAR":
                 entry["sar"] = geometry_bbox or entry["sar"]
+                entry["sar_points"] = geometry_points or entry["sar_points"]
                 entry["optical"] = entry["optical"] or bbox_from_dict(props.get("optical_geometry"))
+                entry["optical_points"] = entry["optical_points"] or props.get("optical_points")
                 entry["split_editing"] = True
             elif source == "Optical":
                 entry["optical"] = geometry_bbox or entry["optical"]
+                entry["optical_points"] = geometry_points or entry["optical_points"]
                 entry["sar"] = entry["sar"] or bbox_from_dict(props.get("sar_geometry"))
+                entry["sar_points"] = entry["sar_points"] or props.get("sar_points")
                 entry["split_editing"] = True
             else:
                 entry["sar"] = geometry_bbox or entry["sar"]
                 entry["optical"] = geometry_bbox or entry["optical"]
+                entry["sar_points"] = geometry_points or entry["sar_points"]
+                entry["optical_points"] = geometry_points or entry["optical_points"]
         annotations = []
         for box_id in sorted(grouped):
             entry = grouped[box_id]
@@ -3649,6 +4098,8 @@ class MainWindow(QMainWindow):
                 damage_level=str(entry.get("damage_level", "")),
                 confidence=str(entry.get("confidence", "average")),
                 split_editing=bool(entry.get("split_editing", False)),
+                points=[tuple(point) for point in entry.get("sar_points", [])] if entry.get("sar_points") else None,
+                optical_points=[tuple(point) for point in entry.get("optical_points", [])] if entry.get("optical_points") else None,
             )
             optical_bbox = entry.get("optical")
             if box.split_editing and optical_bbox is not None:
@@ -3669,6 +4120,8 @@ class MainWindow(QMainWindow):
             "project_root": self.output_dir,
             "sar_dir": self.sar_dir,
             "optical_dir": self.optical_dir,
+            "full_sar_path": self.full_sar_path,
+            "dem_path": self.dem_path,
             "output_dir": self.output_dir,
             "disaster_type": self.disaster_type,
             "project_metadata_rows": self.project_metadata_rows,
@@ -3779,6 +4232,8 @@ class MainWindow(QMainWindow):
 
     def _set_phase(self, phase: str):
         self.phase = phase
+        if phase != "annotate":
+            self._polygon_preview = None
         for btn, name in [(self.tab_setup, "setup"), (self.tab_annotate, "annotate"), (self.tab_metadata, "metadata")]:
             btn.setChecked(name == phase)
         if phase == "setup":
@@ -4168,6 +4623,28 @@ class MainWindow(QMainWindow):
         compare_mode = bool(getattr(self.annotate_page, "overlap_toggle", None) and self.annotate_page.overlap_toggle.isChecked())
         base_kind = self._comparison_base_kind()
         base_boxes = optical_boxes if base_kind == "optical" else sar_boxes
+        preview_box = None
+        if self.phase == "annotate" and self._polygon_preview and self._polygon_preview.get("points"):
+            preview_points = _points_to_tuples(self._polygon_preview.get("points", []))
+            if len(preview_points) >= 2:
+                projected_preview = project_optical_polygon_to_sar(tile, preview_points, self.full_sar_path, self.dem_path)
+                if projected_preview:
+                    preview_box = {
+                        "box_id": -1,
+                        "xmin": _polygon_bounds(projected_preview)[0],
+                        "ymin": _polygon_bounds(projected_preview)[1],
+                        "xmax": _polygon_bounds(projected_preview)[2],
+                        "ymax": _polygon_bounds(projected_preview)[3],
+                        "building_status": "preview",
+                        "damage_level": "",
+                        "confidence": "average",
+                        "split_editing": False,
+                        "points": projected_preview,
+                        "geometry_type": "polygon",
+                    }
+                    sar_boxes.append(preview_box)
+                    if compare_mode:
+                        base_boxes = base_boxes + [preview_box]
         sar_edit = state.get("sar_edit", {})
         has_sar_transform = self._has_sar_edit_transform(sar_edit)
         if hasattr(self.annotate_page, "set_tiles"):
@@ -4265,7 +4742,7 @@ class MainWindow(QMainWindow):
             )
             self.annotate_page.set_header(tile.name, self.current_index, len(self.tile_refs), self.tool_mode, bool(sar_boxes))
             self.annotate_page.set_project_summary(
-                f"Project root: {self.output_dir}\nSAR folder: {self.sar_dir}\nOptical folder: {self.optical_dir}\nOutput folder: {self.output_dir}"
+                f"Project root: {self.output_dir}\nSAR folder: {self.sar_dir}\nOptical folder: {self.optical_dir}\nFull SAR reference: {self.full_sar_path or '[empty]'}\nDEM path: {self.dem_path or '[empty]'}\nOutput folder: {self.output_dir}"
             )
             self.annotate_page.set_boxes(sar_boxes, state["selected_box_id"])
             self._sync_split_edit_toggle(tile, state)
@@ -4462,6 +4939,8 @@ class MainWindow(QMainWindow):
         self.project_root = config["output_dir"]
         self.sar_dir = config["sar_dir"]
         self.optical_dir = config["optical_dir"]
+        self.full_sar_path = config.get("full_sar_path", "")
+        self.dem_path = config.get("dem_path", "")
         self.output_dir = config["output_dir"]
         self.disaster_type = loaded_disaster
         self.project_metadata_rows = loaded_rows
@@ -4472,6 +4951,9 @@ class MainWindow(QMainWindow):
         self.tile_refs = refs
         self._restored_tile_states = state.get("tile_states", {}) if state else {}
         self.tile_states = {}
+        if state:
+            self.full_sar_path = state.get("full_sar_path", self.full_sar_path)
+            self.dem_path = state.get("dem_path", self.dem_path)
         if resume_project and state and state.get("current_index") is not None and processed_tiles:
             current_index = int(state.get("last_processed_index", state.get("current_index", 0)))
         elif resume_project and state and state.get("processed_tiles"):
@@ -4510,17 +4992,48 @@ class MainWindow(QMainWindow):
         if tile is None:
             return
         image_kind = box_data.get("image_kind", "sar")
-        box = BoxAnnotation(
-            state["next_box_id"],
-            box_data["xmin"],
-            box_data["ymin"],
-            box_data["xmax"],
-            box_data["ymax"],
-            confidence=self._confidence_label(self.annotate_page.confidence_slider.value()) if hasattr(self.annotate_page, "confidence_slider") else "average",
-        )
-        if self._selected_split_editing(tile, state):
-            box.enable_split_editing()
-            box.set_geometry(image_kind, box_data["xmin"], box_data["ymin"], box_data["xmax"], box_data["ymax"])
+        box_id = state["next_box_id"]
+        confidence = self._confidence_label(self.annotate_page.confidence_slider.value()) if hasattr(self.annotate_page, "confidence_slider") else "average"
+        if image_kind == "optical" and box_data.get("points"):
+            optical_points = _points_to_tuples(box_data["points"])
+            sar_points = project_optical_polygon_to_sar(tile, optical_points, self.full_sar_path, self.dem_path)
+            sar_bounds = _polygon_bounds(sar_points)
+            if sar_bounds is None:
+                return
+            box = BoxAnnotation(
+                box_id,
+                *sar_bounds,
+                confidence=confidence,
+                split_editing=True,
+                points=sar_points,
+                optical_points=optical_points,
+            )
+            optical_bounds = _polygon_bounds(optical_points)
+            if optical_bounds is not None:
+                box.optical_xmin, box.optical_ymin, box.optical_xmax, box.optical_ymax = optical_bounds
+        elif box_data.get("points"):
+            points = _points_to_tuples(box_data["points"])
+            bounds = _polygon_bounds(points)
+            if bounds is None:
+                return
+            box = BoxAnnotation(
+                box_id,
+                *bounds,
+                confidence=confidence,
+                points=points,
+            )
+        else:
+            box = BoxAnnotation(
+                box_id,
+                box_data["xmin"],
+                box_data["ymin"],
+                box_data["xmax"],
+                box_data["ymax"],
+                confidence=confidence,
+            )
+            if self._selected_split_editing(tile, state):
+                box.enable_split_editing()
+                box.set_geometry(image_kind, box_data["xmin"], box_data["ymin"], box_data["xmax"], box_data["ymax"])
         state["next_box_id"] += 1
         state["annotations"].append(box)
         state["selected_box_id"] = box.box_id
@@ -4542,7 +5055,37 @@ class MainWindow(QMainWindow):
         if box is None:
             return
         image_kind = box_data.get("image_kind", "sar")
-        box.set_geometry(image_kind, box_data["xmin"], box_data["ymin"], box_data["xmax"], box_data["ymax"])
+        if box_data.get("points") or box.points:
+            start_bbox = (
+                float(box_data.get("start_xmin", box.xmin)),
+                float(box_data.get("start_ymin", box.ymin)),
+                float(box_data.get("start_xmax", box.xmax)),
+                float(box_data.get("start_ymax", box.ymax)),
+            )
+            end_bbox = (
+                float(box_data["xmin"]),
+                float(box_data["ymin"]),
+                float(box_data["xmax"]),
+                float(box_data["ymax"]),
+            )
+            if image_kind == "optical":
+                optical_source = box_data.get("optical_points") or box_data.get("start_optical_points") or box.optical_points or box_data.get("points") or []
+                box.optical_points = transform_points_between_bboxes(optical_source, start_bbox, end_bbox)
+                optical_bounds = _polygon_bounds(box.optical_points)
+                if optical_bounds is not None:
+                    box.optical_xmin, box.optical_ymin, box.optical_xmax, box.optical_ymax = optical_bounds
+                box.points = project_optical_polygon_to_sar(tile, box.optical_points, self.full_sar_path, self.dem_path)
+                sar_bounds = _polygon_bounds(box.points)
+                if sar_bounds is not None:
+                    box.xmin, box.ymin, box.xmax, box.ymax = sar_bounds
+            else:
+                sar_source = box_data.get("points") or box_data.get("start_points") or box.points or []
+                box.points = transform_points_between_bboxes(sar_source, start_bbox, end_bbox)
+                sar_bounds = _polygon_bounds(box.points)
+                if sar_bounds is not None:
+                    box.xmin, box.ymin, box.xmax, box.ymax = sar_bounds
+        else:
+            box.set_geometry(image_kind, box_data["xmin"], box_data["ymin"], box_data["xmax"], box_data["ymax"])
         state["selected_box_id"] = box.box_id
         self._save_project_state()
         self.refresh_views()
@@ -4624,13 +5167,19 @@ class MainWindow(QMainWindow):
         else:
             box.damage_level = ""
         self.metadata_page._update_damage_visibility()
-        box.set_geometry(
-            "sar",
-            self.metadata_page.xmin_spin.value(),
-            self.metadata_page.ymin_spin.value(),
-            self.metadata_page.xmax_spin.value(),
-            self.metadata_page.ymax_spin.value(),
-        )
+        if box.points or box.optical_points:
+            box.xmin = self.metadata_page.xmin_spin.value()
+            box.ymin = self.metadata_page.ymin_spin.value()
+            box.xmax = self.metadata_page.xmax_spin.value()
+            box.ymax = self.metadata_page.ymax_spin.value()
+        else:
+            box.set_geometry(
+                "sar",
+                self.metadata_page.xmin_spin.value(),
+                self.metadata_page.ymin_spin.value(),
+                self.metadata_page.xmax_spin.value(),
+                self.metadata_page.ymax_spin.value(),
+            )
         self.project_metadata_rows = self.setup_page.metadata_rows()
         self.project_metadata = self.setup_page.project_metadata()
         self.disaster_type = self.setup_page.disaster_type.text().strip()
