@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import importlib.util
 import os
 import re
 import ctypes
@@ -56,7 +58,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.23"
+APP_VERSION = "1.0.24"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
@@ -119,10 +121,18 @@ APP_LOGO_PATH = resource_path("ats_logo.png")
 LOCAL_UPDATE_MANIFEST_PATH = runtime_root() / "update_manifest.local.json"
 USER_HEIGHT_OFFSET = 0
 DEFAULT_GEO_CRS = "EPSG:4326"
+logger = logging.getLogger(__name__)
+LIVE_ALIGNER_PATH = Path(__file__).resolve().parent.parent / "sar-live-aligner.py"
 
 
 def _points_to_tuples(points):
-    if not points:
+    if points is None:
+        return []
+    if isinstance(points, np.ndarray):
+        if points.size == 0:
+            return []
+        return [(float(x), float(y)) for x, y in points.tolist()]
+    if len(points) == 0:
         return []
     return [(float(x), float(y)) for x, y in points]
 
@@ -134,6 +144,18 @@ def _polygon_bounds(points):
     xs = [pt[0] for pt in pts]
     ys = [pt[1] for pt in pts]
     return min(xs), min(ys), max(xs), max(ys)
+
+
+@lru_cache(maxsize=1)
+def _load_live_aligner_module():
+    if not LIVE_ALIGNER_PATH.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("sar_live_aligner_runtime", str(LIVE_ALIGNER_PATH))
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class RPCModel:
@@ -283,7 +305,14 @@ def live_coordinates_computation(points: np.ndarray, rpc_projector, tile_transfo
     tile_geo_transform, transform_meta = tile_transformations
     rows, cols = rpc_projector(points)
     points_global = np.column_stack((cols, rows)).astype(np.float64)
-    tile_frame_coords = transform_points_to_crop(points_global, **transform_meta)
+    required_meta = ("w_col_off", "w_row_off", "crop_x", "crop_y", "M")
+    if all(key in transform_meta for key in required_meta):
+        try:
+            tile_frame_coords = transform_points_to_crop(points_global, **{key: transform_meta[key] for key in required_meta})
+        except Exception:
+            tile_frame_coords = points_global
+    else:
+        tile_frame_coords = points_global
     tile_frame_x, tile_frame_y = tile_geo_transform * (tile_frame_coords[:, 0], tile_frame_coords[:, 1])
     return np.column_stack((tile_frame_x, tile_frame_y))
 
@@ -297,25 +326,27 @@ def initialize_transformations(sar_file: str, dem_file: str, sar_tile: str):
 
 
 def project_optical_polygon_to_sar(tile: TileRecord, optical_points, full_sar_path: str, dem_path: str):
-    points = np.asarray(_points_to_tuples(optical_points), dtype=np.float64)
+    original_points = np.asarray(_points_to_tuples(optical_points), dtype=np.float64)
+    points = np.array(original_points, copy=True)
     if points.size == 0:
         return []
     try:
-        if full_sar_path:
-            with rasterio.open(full_sar_path) as full_sar_src:
-                full_sar_crs = full_sar_src.crs
-            if tile.optical_crs and full_sar_crs and tile.optical_crs != full_sar_crs:
-                transformer = Transformer.from_crs(tile.optical_crs, full_sar_crs, always_xy=True)
-                xs, ys = transformer.transform(points[:, 0], points[:, 1])
-                points = np.column_stack((xs, ys))
-        if not full_sar_path or not dem_path:
-            return [(float(x), float(y)) for x, y in points]
-        rpc_projector, tile_transformations = initialize_transformations(full_sar_path, dem_path, str(tile.sar_path))
-        projected = live_coordinates_computation(points, rpc_projector, tile_transformations)
-        return [(float(x), float(y)) for x, y in projected]
+        module = _load_live_aligner_module()
+        if module is None or not full_sar_path or not dem_path:
+            return [(float(x), float(y)) for x, y in original_points]
+
+        if tile.optical_crs and tile.sar_crs and tile.optical_crs != tile.sar_crs:
+            transformer = Transformer.from_crs(tile.optical_crs, tile.sar_crs, always_xy=True)
+            xs, ys = transformer.transform(points[:, 0], points[:, 1])
+            points = np.column_stack((xs, ys))
+
+        rpc_projector, tile_transformations = module.initialize_transformations(full_sar_path, dem_path, str(tile.sar_path))
+        projected = module.live_coordinates_computation(points, rpc_projector, tile_transformations)
+        projected_points = [(float(x), float(y)) for x, y in projected]
+        return projected_points
     except Exception as exc:
         logger.error("Failed to project optical polygon to SAR: %s", exc)
-        return [(float(x), float(y)) for x, y in points]
+        return [(float(x), float(y)) for x, y in original_points]
 
 
 def transform_points_between_bboxes(points, start_bbox, end_bbox):
@@ -592,6 +623,13 @@ def apply_theme(app: QApplication, t: dict) -> None:
             font-family: "DM Mono", monospace;
             padding: 0 4px;
         }}
+        QLabel#TraceLog {{
+            background: transparent;
+            color: {t["text_secondary"]};
+            font-size: 11px;
+            font-family: "DM Mono", monospace;
+            padding: 0 4px;
+        }}
         QLabel#VersionPill {{
             background: {t["bg2"]};
             color: {t["text_secondary"]};
@@ -646,6 +684,11 @@ def apply_theme(app: QApplication, t: dict) -> None:
         QPushButton#SkipBtn:hover, QPushButton#Skip2Btn:hover, QPushButton#BackBtn:hover {{
             background: {t["bg3"]};
             color: {t["text_primary"]};
+        }}
+        QFrame#TraceBar {{
+            background: {t["bg1"]};
+            border-top: 1px solid {t["border_strong"]};
+            border-bottom: 1px solid {t["border_strong"]};
         }}
         QListWidget::item {{
             padding: 8px 10px;
@@ -2190,7 +2233,7 @@ class ImagePane(QFrame):
             }
         )
         self.boxDrawn.emit({"points": points, "image_kind": self.image_kind})
-        QTimer.singleShot(0, self._clear_polygon_draw)
+        QTimer.singleShot(250, self._clear_polygon_draw)
 
     def _start_overlay_drag(self, event):
         self._interaction = {
@@ -2387,9 +2430,7 @@ class ImagePane(QFrame):
             self._temp_rect = None
         elif self._interaction["kind"] == "draw_polygon":
             if self._interaction.get("finished"):
-                self._interaction = None
-                self._temp_rect = None
-                self.unsetCursor()
+                return
             else:
                 self.polygonPreviewChanged.emit({"image_kind": self.image_kind, "active": False})
             self.update()
@@ -3656,6 +3697,17 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self.version_label)
 
         central_layout.addWidget(self.top_bar)
+        self.trace_bar = QFrame()
+        self.trace_bar.setObjectName("TraceBar")
+        trace_layout = QHBoxLayout(self.trace_bar)
+        trace_layout.setContentsMargins(12, 6, 12, 6)
+        trace_layout.setSpacing(10)
+        self.trace_log = QLabel("trace: idle")
+        self.trace_log.setObjectName("TraceLog")
+        self.trace_log.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        trace_layout.addWidget(self.trace_log)
+        trace_layout.addStretch(1)
+        central_layout.addWidget(self.trace_bar)
         central_layout.addWidget(self.stack, 1)
         self.setCentralWidget(central)
 
@@ -3738,6 +3790,26 @@ class MainWindow(QMainWindow):
     def _set_update_log(self, text: str):
         if hasattr(self, "update_log") and self.update_log is not None:
             self.update_log.setText(text)
+
+    def _set_trace_log(self, text: str):
+        if hasattr(self, "trace_log") and self.trace_log is not None:
+            self.trace_log.setText(text)
+
+    def _format_points_for_log(self, points, max_points: int = 10):
+        pts = _points_to_tuples(points)
+        if not pts:
+            return "[]"
+        shown = ", ".join(f"({x:.3f}, {y:.3f})" for x, y in pts[:max_points])
+        if len(pts) > max_points:
+            shown += f", ... (+{len(pts) - max_points} more)"
+        return f"[{shown}]"
+
+    def _log_polygon_projection(self, optical_points, sar_points, source: str = "rpc"):
+        optical_text = self._format_points_for_log(optical_points)
+        sar_text = self._format_points_for_log(sar_points)
+        message = f"polygon {source} | optical={optical_text} | sar={sar_text}"
+        self._set_trace_log(message)
+        logger.info(message)
 
     def _polygon_preview_changed(self, payload: dict):
         if not isinstance(payload, dict) or payload.get("image_kind") != "optical":
@@ -5030,6 +5102,7 @@ class MainWindow(QMainWindow):
                 sar_bounds = _polygon_bounds(sar_points)
             if sar_bounds is None:
                 return
+            self._log_polygon_projection(optical_points, sar_points, "optical-draw")
             box = BoxAnnotation(
                 box_id,
                 *sar_bounds,
