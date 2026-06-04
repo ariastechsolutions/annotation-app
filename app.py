@@ -58,7 +58,7 @@ from PySide6.QtWidgets import (
 
 
 APP_TITLE = "ATS Annotation Tool"
-APP_VERSION = "1.0.24"
+APP_VERSION = "1.0.25"
 UPDATE_OWNER = "ariastechsolutions"
 UPDATE_REPO = "annotation-app"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_OWNER}/{UPDATE_REPO}/releases/latest"
@@ -1706,6 +1706,21 @@ def bbox_from_dict(payload):
         return None
 
 
+def rectangle_polygon_from_bbox(bounds):
+    if bounds is None:
+        return None
+    xmin, ymin, xmax, ymax = bounds
+    return Polygon(
+        [
+            (xmin, ymax),
+            (xmax, ymax),
+            (xmax, ymin),
+            (xmin, ymin),
+            (xmin, ymax),
+        ]
+    )
+
+
 def export_tile(tile: TileRecord, output_dir: Path, project_meta: dict):
     with rasterio.open(tile.sar_path) as src:
         transform = src.transform
@@ -1916,6 +1931,227 @@ def export_tile(tile: TileRecord, output_dir: Path, project_meta: dict):
         "features": features,
     }
     geojson_path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
+
+
+def export_tile_with_polygons(tile: TileRecord, output_dir: Path, project_meta: dict):
+    with rasterio.open(tile.sar_path) as src:
+        transform = src.transform
+        crs = src.crs
+        width = src.width
+        height = src.height
+
+    mask_path = output_dir / "Masks" / f"{tile.name}.tif"
+    bbox_geojson_path = output_dir / "Polygons" / f"{tile.name}.geojson"
+    polygon_geojson_path = output_dir / "Polygons" / f"{tile.name}_poly.geojson"
+    any_split = any(box.split_editing for box in tile.annotations)
+    damage_lookup = {"Minor": 1, "Major": 2, "Destroyed": 3}
+
+    def source_kind(source: str):
+        return "optical" if source == "Optical" else "sar"
+
+    def bbox_geometry(box: BoxAnnotation, source: str):
+        return rectangle_polygon_from_bbox(box.geometry_for(source_kind(source)))
+
+    def polygon_geometry(box: BoxAnnotation, source: str):
+        return box.polygon(source_kind(source))
+
+    def geometry_for_mode(box: BoxAnnotation, source: str, mode: str):
+        return polygon_geometry(box, source) if mode == "polygon" else bbox_geometry(box, source)
+
+    def source_entries(mode: str, source_filter: str | None = None):
+        entries = []
+        for box in tile.annotations:
+            if box.split_editing:
+                for source in ("SAR", "Optical"):
+                    if source_filter is not None and source != source_filter:
+                        continue
+                    geom = geometry_for_mode(box, source, mode)
+                    if geom is not None:
+                        entries.append((geom, box))
+            else:
+                if source_filter is not None and source_filter not in ("SAR", "Optical", "both"):
+                    continue
+                geom = geometry_for_mode(box, "both", mode)
+                if geom is not None:
+                    entries.append((geom, box))
+        return entries
+
+    def rasterize_triplet(entries):
+        binary = rasterize(
+            [(geom, 255) for geom, _box in entries],
+            out_shape=(height, width),
+            transform=transform,
+            fill=0,
+            dtype="uint8",
+        )
+        status = rasterize(
+            [(geom, 1 if box.building_status == "intact" else 2) for geom, box in entries],
+            out_shape=(height, width),
+            transform=transform,
+            fill=0,
+            dtype="uint8",
+        )
+        damage = rasterize(
+            [(geom, damage_lookup.get(box.damage_level, 0)) for geom, box in entries],
+            out_shape=(height, width),
+            transform=transform,
+            fill=0,
+            dtype="uint8",
+        )
+        return binary, status, damage
+
+    if not any_split:
+        bbox_binary, bbox_status, bbox_damage = rasterize_triplet(source_entries("bbox"))
+        poly_binary, poly_status, poly_damage = rasterize_triplet(source_entries("polygon"))
+        with rasterio.open(
+            mask_path,
+            "w",
+            driver="GTiff",
+            height=height,
+            width=width,
+            count=6,
+            dtype="uint8",
+            crs=crs,
+            transform=transform,
+            nodata=0,
+            compress="lzw",
+        ) as dst:
+            dst.write(bbox_binary, 1)
+            dst.write(bbox_status, 2)
+            dst.write(bbox_damage, 3)
+            dst.write(poly_binary, 4)
+            dst.write(poly_status, 5)
+            dst.write(poly_damage, 6)
+            dst.set_band_description(1, "both_buildings")
+            dst.set_band_description(2, "both_buildings_binary_classification")
+            dst.set_band_description(3, "both_buildings_damage_level")
+            dst.set_band_description(4, "both_polygons_buildings")
+            dst.set_band_description(5, "both_polygons_binary_classification")
+            dst.set_band_description(6, "both_polygons_damage_level")
+            dst.write_colormap(2, {0: (0, 0, 0, 255), 1: (0, 255, 0, 255), 2: (255, 0, 0, 255)})
+            dst.write_colormap(3, {0: (0, 0, 0, 255), 1: (255, 255, 0, 255), 2: (255, 165, 0, 255), 3: (128, 0, 128, 255)})
+            dst.write_colormap(5, {0: (0, 0, 0, 255), 1: (0, 255, 0, 255), 2: (255, 0, 0, 255)})
+            dst.write_colormap(6, {0: (0, 0, 0, 255), 1: (255, 255, 0, 255), 2: (255, 165, 0, 255), 3: (128, 0, 128, 255)})
+    else:
+        sar_bbox_binary, sar_bbox_status, sar_bbox_damage = rasterize_triplet(source_entries("bbox", "SAR"))
+        optical_bbox_binary, optical_bbox_status, optical_bbox_damage = rasterize_triplet(source_entries("bbox", "Optical"))
+        sar_poly_binary, sar_poly_status, sar_poly_damage = rasterize_triplet(source_entries("polygon", "SAR"))
+        optical_poly_binary, optical_poly_status, optical_poly_damage = rasterize_triplet(source_entries("polygon", "Optical"))
+        with rasterio.open(
+            mask_path,
+            "w",
+            driver="GTiff",
+            height=height,
+            width=width,
+            count=12,
+            dtype="uint8",
+            crs=crs,
+            transform=transform,
+            nodata=0,
+            compress="lzw",
+        ) as dst:
+            dst.write(sar_bbox_binary, 1)
+            dst.write(sar_bbox_status, 2)
+            dst.write(sar_bbox_damage, 3)
+            dst.write(optical_bbox_binary, 4)
+            dst.write(optical_bbox_status, 5)
+            dst.write(optical_bbox_damage, 6)
+            dst.write(sar_poly_binary, 7)
+            dst.write(sar_poly_status, 8)
+            dst.write(sar_poly_damage, 9)
+            dst.write(optical_poly_binary, 10)
+            dst.write(optical_poly_status, 11)
+            dst.write(optical_poly_damage, 12)
+            dst.set_band_description(1, "sar_buildings")
+            dst.set_band_description(2, "sar_buildings_binary_classification")
+            dst.set_band_description(3, "sar_buildings_damage_level")
+            dst.set_band_description(4, "optical_buildings")
+            dst.set_band_description(5, "optical_buildings_binary_classification")
+            dst.set_band_description(6, "optical_buildings_damage_level")
+            dst.set_band_description(7, "sar_polygons_buildings")
+            dst.set_band_description(8, "sar_polygons_binary_classification")
+            dst.set_band_description(9, "sar_polygons_damage_level")
+            dst.set_band_description(10, "optical_polygons_buildings")
+            dst.set_band_description(11, "optical_polygons_binary_classification")
+            dst.set_band_description(12, "optical_polygons_damage_level")
+            dst.write_colormap(2, {0: (0, 0, 0, 255), 1: (0, 255, 0, 255), 2: (255, 0, 0, 255)})
+            dst.write_colormap(3, {0: (0, 0, 0, 255), 1: (255, 255, 0, 255), 2: (255, 165, 0, 255), 3: (128, 0, 128, 255)})
+            dst.write_colormap(5, {0: (0, 0, 0, 255), 1: (0, 255, 0, 255), 2: (255, 0, 0, 255)})
+            dst.write_colormap(6, {0: (0, 0, 0, 255), 1: (255, 255, 0, 255), 2: (255, 165, 0, 255), 3: (128, 0, 128, 255)})
+
+    transformer = Transformer.from_crs(tile.display_crs, "EPSG:4326", always_xy=True) if tile.display_crs else None
+
+    def build_features(mode: str):
+        features = []
+        for box in tile.annotations:
+            if box.split_editing:
+                geometries = [("SAR", geometry_for_mode(box, "SAR", mode)), ("Optical", geometry_for_mode(box, "Optical", mode))]
+            else:
+                geometries = [("both", geometry_for_mode(box, "both", mode))]
+            for source, geom in geometries:
+                if geom is None:
+                    continue
+                export_geom = geom
+                if transformer is not None:
+                    export_geom = Polygon([transformer.transform(x, y) for x, y in geom.exterior.coords])
+                features.append(
+                    {
+                        "type": "Feature",
+                        "geometry": mapping(export_geom),
+                        "properties": {
+                            "box_id": box.box_id,
+                            "source": source,
+                            "geometry_role": mode,
+                            "building_status": box.building_status,
+                            "damage_level": box.damage_level,
+                            "confidence": box.confidence,
+                            "split_editing": box.split_editing,
+                            "sar_points": [list(point) for point in box.points] if box.points else [],
+                            "optical_points": [list(point) for point in box.optical_points] if box.optical_points else [],
+                            "sar_geometry": {
+                                "xmin": box.xmin,
+                                "ymin": box.ymin,
+                                "xmax": box.xmax,
+                                "ymax": box.ymax,
+                            },
+                            "optical_geometry": {
+                                "xmin": box.optical_xmin if box.optical_xmin is not None else box.xmin,
+                                "ymin": box.optical_ymin if box.optical_ymin is not None else box.ymin,
+                                "xmax": box.optical_xmax if box.optical_xmax is not None else box.xmax,
+                                "ymax": box.optical_ymax if box.optical_ymax is not None else box.ymax,
+                            },
+                            "disaster_type": project_meta.get("disaster_type", ""),
+                            "project_metadata": project_meta.get("project_metadata", {}),
+                            "tile_name": tile.name,
+                        },
+                    }
+                )
+        return features
+
+    bbox_geojson = {
+        "type": "FeatureCollection",
+        "name": tile.name,
+        "properties": {
+            "tile_name": tile.name,
+            "source_crs": str(tile.display_crs) if tile.display_crs else None,
+            "geojson_crs": "EPSG:4326" if transformer is not None else str(tile.display_crs),
+            "geometry_role": "bbox",
+        },
+        "features": build_features("bbox"),
+    }
+    polygon_geojson = {
+        "type": "FeatureCollection",
+        "name": tile.name,
+        "properties": {
+            "tile_name": tile.name,
+            "source_crs": str(tile.display_crs) if tile.display_crs else None,
+            "geojson_crs": "EPSG:4326" if transformer is not None else str(tile.display_crs),
+            "geometry_role": "polygon",
+        },
+        "features": build_features("polygon"),
+    }
+    bbox_geojson_path.write_text(json.dumps(bbox_geojson, indent=2), encoding="utf-8")
+    polygon_geojson_path.write_text(json.dumps(polygon_geojson, indent=2), encoding="utf-8")
 
 
 def save_aligned_sar_raster(
@@ -4116,17 +4352,21 @@ class MainWindow(QMainWindow):
             return None
         return Path(self.output_dir) / "Polygons" / f"{tile_name}.geojson"
 
-    def _load_annotations_from_geojson(self, tile: TileRecord):
-        path = self._geojson_path_for_tile(tile.name)
+    def _polygon_geojson_path_for_tile(self, tile_name: str):
+        if not self.output_dir:
+            return None
+        return Path(self.output_dir) / "Polygons" / f"{tile_name}_poly.geojson"
+
+    def _ingest_geojson_annotations(self, tile: TileRecord, path: Path | None, grouped: dict, prefer_points: bool = False):
         if path is None or not path.is_file():
-            return []
+            return grouped
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            return []
+            return grouped
         features = payload.get("features", [])
         if not isinstance(features, list) or not features:
-            return []
+            return grouped
         geojson_crs = payload.get("properties", {}).get("geojson_crs")
         transformer = None
         if geojson_crs and tile.display_crs and str(geojson_crs) != str(tile.display_crs):
@@ -4134,7 +4374,6 @@ class MainWindow(QMainWindow):
                 transformer = Transformer.from_crs(geojson_crs, tile.display_crs, always_xy=True)
             except Exception:
                 transformer = None
-        grouped = {}
         for feature in features:
             if not isinstance(feature, dict):
                 continue
@@ -4162,22 +4401,43 @@ class MainWindow(QMainWindow):
             geometry_bbox = bbox_from_geometry(feature.get("geometry"), transformer)
             geometry_points = points_from_geometry(feature.get("geometry"), transformer)
             if source == "SAR":
-                entry["sar"] = geometry_bbox or entry["sar"]
-                entry["sar_points"] = geometry_points or entry["sar_points"]
-                entry["optical"] = entry["optical"] or bbox_from_dict(props.get("optical_geometry"))
-                entry["optical_points"] = entry["optical_points"] or props.get("optical_points")
+                if geometry_bbox is not None:
+                    entry["sar"] = geometry_bbox
+                if geometry_points and (prefer_points or not entry["sar_points"]):
+                    entry["sar_points"] = geometry_points
+                optical_bbox = bbox_from_dict(props.get("optical_geometry"))
+                if optical_bbox is not None and entry["optical"] is None:
+                    entry["optical"] = optical_bbox
+                optical_points = props.get("optical_points")
+                if isinstance(optical_points, list) and optical_points and (prefer_points or not entry["optical_points"]):
+                    entry["optical_points"] = optical_points
                 entry["split_editing"] = True
             elif source == "Optical":
-                entry["optical"] = geometry_bbox or entry["optical"]
-                entry["optical_points"] = geometry_points or entry["optical_points"]
-                entry["sar"] = entry["sar"] or bbox_from_dict(props.get("sar_geometry"))
-                entry["sar_points"] = entry["sar_points"] or props.get("sar_points")
+                if geometry_bbox is not None:
+                    entry["optical"] = geometry_bbox
+                if geometry_points and (prefer_points or not entry["optical_points"]):
+                    entry["optical_points"] = geometry_points
+                sar_bbox = bbox_from_dict(props.get("sar_geometry"))
+                if sar_bbox is not None and entry["sar"] is None:
+                    entry["sar"] = sar_bbox
+                sar_points = props.get("sar_points")
+                if isinstance(sar_points, list) and sar_points and (prefer_points or not entry["sar_points"]):
+                    entry["sar_points"] = sar_points
                 entry["split_editing"] = True
             else:
-                entry["sar"] = geometry_bbox or entry["sar"]
-                entry["optical"] = geometry_bbox or entry["optical"]
-                entry["sar_points"] = geometry_points or entry["sar_points"]
-                entry["optical_points"] = geometry_points or entry["optical_points"]
+                if geometry_bbox is not None:
+                    entry["sar"] = geometry_bbox
+                    entry["optical"] = geometry_bbox
+                if geometry_points and (prefer_points or not entry["sar_points"]):
+                    entry["sar_points"] = geometry_points
+                if geometry_points and (prefer_points or not entry["optical_points"]):
+                    entry["optical_points"] = geometry_points
+        return grouped
+
+    def _load_annotations_from_geojson(self, tile: TileRecord):
+        grouped = {}
+        grouped = self._ingest_geojson_annotations(tile, self._polygon_geojson_path_for_tile(tile.name), grouped, prefer_points=True)
+        grouped = self._ingest_geojson_annotations(tile, self._geojson_path_for_tile(tile.name), grouped, prefer_points=False)
         annotations = []
         for box_id in sorted(grouped):
             entry = grouped[box_id]
@@ -5352,7 +5612,7 @@ class MainWindow(QMainWindow):
         self.project_metadata_rows = self.setup_page.metadata_rows()
         self.project_metadata = self.setup_page.project_metadata()
         self.disaster_type = self.setup_page.disaster_type.text().strip()
-        export_tile(
+        export_tile_with_polygons(
             tile,
             output_dir,
             {

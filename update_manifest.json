@@ -1,5 +1,5 @@
 {
-  "latest_version": "1.0.24",
+  "latest_version": "1.0.25",
   "release_name": "ATS Annotation Tool 1.0.23",
   "body": "Keep completed optical polygons from disappearing on finish and preserve the final draw state long enough to commit it cleanly.",
   "release_url": "https://github.com/ariastechsolutions/annotation-app/releases/latest",
